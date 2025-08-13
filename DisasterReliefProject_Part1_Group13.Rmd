@@ -1,0 +1,1239 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE)
+knitr::opts_chunk$set(cache=TRUE, autodep=TRUE)
+knitr::opts_chunk$set(fig.align="center", fig.pos="tbh")
+```
+
+```{r packages}
+#| warning: FALSE
+#| message: FALSE
+library(tidyverse)
+library(tidymodels)
+library(discrim) # for LDA and QDA
+library(ggcorrplot)  # for correlation plot
+library(GGally)  # scatterplot matrix
+library(patchwork)  # for combining plots
+library(probably)  # for threshold_perf
+library(pROC)
+library(data.table)
+library(patchwork)
+library(caret)
+```
+
+```{r setup-parallel}
+#| cache: FALSE
+#| message: false
+#| warning: FALSE
+
+#Set up parallel processing
+library(doParallel)
+cl <- makePSOCKcluster(parallel::detectCores(logical = FALSE))
+registerDoParallel(cl)
+```
+
+```{r load training data, include = FALSE}
+#| warning: FALSE
+#| message: FALSE
+##Load training data
+haiti_pixels = read.csv("HaitiPixels.csv")
+haiti_pixels
+
+#Transform data to factors
+haiti_pixels <- haiti_pixels %>% 
+  mutate(Class = ifelse(Class == 'Blue Tarp','Blue_Tarp','Non_Tarp')) %>% 
+  mutate(Class = as.factor(Class)) %>% 
+  select('Red','Green','Blue','Class')
+```
+
+```{r load holdout data, include = FALSE}
+#| warning: FALSE
+#| message: FALSE
+# Load holdout data
+read_holdout_data <- function(filepath){
+  fread(filepath, header = FALSE, select = c(2:10), col.names = c('X', 'Y', 'Map X', 'Map Y', 'Lat', 'Lon', 'Red', 'Green', 'Blue'))
+}
+
+nb57 = read_holdout_data("HoldOutData/orthovnir057_ROI_NON_Blue_Tarps.txt")
+b67 = read_holdout_data("HoldOutData/orthovnir067_ROI_Blue_Tarps.txt")
+nb67 = read_holdout_data("HoldOutData/orthovnir067_ROI_NOT_Blue_Tarps.txt")
+b69 = read_holdout_data("HoldOutData/orthovnir069_ROI_Blue_Tarps.txt")
+nb69 = read_holdout_data("HoldOutData/orthovnir069_ROI_NOT_Blue_Tarps.txt")
+b78 = read_holdout_data("HoldOutData/orthovnir078_ROI_Blue_Tarps.txt")
+nb78 = read_holdout_data("HoldOutData/orthovnir078_ROI_NON_Blue_Tarps.txt")
+
+# Transform holdout data
+blue_df <- rbind(b67, b69, b78) %>% 
+  mutate(Class = 'Blue_Tarp')
+nonblue_df <- rbind(nb57, nb67, nb69, nb78) %>% 
+  mutate(Class = 'Non_Tarp')
+total_holdout <- rbind(blue_df, nonblue_df)
+total_holdout <- total_holdout %>% 
+  mutate(Class = as.factor(Class)) %>% 
+  select('Red','Green','Blue','Class')
+```
+
+<center> <h1>Disaster Relief Project, Part 1</h1> </center>
+<center> <h5>Group 13: Sarah Christen, Katherine Kelleher, Margaret Lindsay, and Brian Nolton</h5> </center>
+
+### I. Introduction
+
+After an earthquake devastated Haiti in 2010, coordinated disaster relief efforts needed efficient and reliable means of locating displaced people. Many of these displaced individuals used blue tarps for temporary shelter. As these blue tarps stood out in aerial images, the Rochester Institute of Technology collected high resolution imagery from across affected areas of the island. While these images provided an effective method for identifying the location of displaced people that could be shared with rescue workers, the volume of the images and the urgent need to provide resources to affected individuals posed a challenge.  
+
+The goal of this project is to address this challenge in a similar manner to how it was addressed by disaster response organizations and their partners: using statistical models to efficiently and accurately identify the location of blue tarps in aerial imagery. Using the extracted RGB values from each pixel in these images, we built models to determine whether the pixel contained a blue tarp. In the first portion of this project, we built models using Linear Discriminant Analysis (LDA), Quadratic Discriminant Analysis (QDA), and Logistic Regression. 
+
+### II. Data
+
+A training dataset consisting of 63,241 observations was used to develop the three models. The training dataset had four columns: Class, Red, Green, and Blue. The Class variable contained five levels in the training set: Blue Tarp, Rooftop, Soil, Various Non-Tarp, and Vegetation. However, as the aim of this project is to identify a pixel as a blue tarp or not a blue tarp, we updated the Class variable in the training set to a binary variable: “Blue_Tarp” if the Class was “Blue Tarp” and “Non_Tarp” for all other values. Class therefore functions as the binary response variable, which indicates whether the pixel represents a blue tarp or not. The Red, Green, and Blue columns represent the hue the camera captured. Each color has a numerical scale from 0-255, together they make the hue of the pixel in a photograph.
+
+The holdout dataset came with many files, mostly .txt files but a few .jpg files as well. Since we did not have the means to convert the .jpg files to an RGB data format these files were left alone. The .txt files were organized into what appear to be four regions (or flight paths from when the data was taken), region 57, 67, 71, and 78. Regions 67, 71, and 78 have separate files for Blue Tarps and Non-Blue Tarps making it easy to distinguish the response variable, while region 57 only has a Non-Blue Tarp data set. Region 67 had two Blue Tarp datasets. After inspecting both files it appeared that one of them was the original dataset and one of them was a pre-processed copy of the dataset stripped down to the RGB columns. Since they were duplicates, we chose to use the original dataset because importing the data would be easier since this file follows the same form as the other datasets allowing us to define a function to process all the datasets the same way.
+
+The three predictor variables were the red, green, and blue pixel values from the aerial images. While the training data column headers specified the red, blue, and green columns, the holdout data files did not and instead labelled the columns B1, B2, and B3. Intuition would tell us the order should be red, green, and blue, but we decided to verify this. We compared the box plots for the training and holdout datasets specifically for each color split out by known Blue Tarps and Non-Blue Tarps in Figure 1. We noticed the same trend in the colors for each set of data. For the Blue Tarp data, Red had the lowest median, Blue had the highest media, and Green was somewhere in between for both the training and holdout data. For the Non-Blue Tarp data, the exact opposite was true. Red had the highest median, Blue had the lowest, and Green was still somewhere in between. Because of this, we were able to deduce the colors for the holdout dataset columns were indeed in the order of Red, Green, and Blue.
+
+
+```{r boxplot-filter-data}
+#| warning: FALSE
+#| message: FALSE
+hblue_df <- haiti_pixels %>% 
+  filter(Class == "Blue_Tarp")
+hnonblue_df <- haiti_pixels %>% 
+  filter(Class == "Non_Tarp")
+```
+
+```{r boxplot-bluetarp}
+#| fig.cap: Figure 1. Boxplots of Red, Green, Blue Variables in Training and Holdout Datasets For Tarp and Non-Tarp Pixels
+#| out.width: 95%
+#| fig.width: 10
+#| fig.height: 4
+#| warning: FALSE
+#| message: FALSE
+tarp <- ggplot() +
+  geom_boxplot(data = hblue_df, aes(x = factor("T Red"), y = Red, fill = "Training Data")) +
+  geom_boxplot(data = hblue_df, aes(x = factor("T Green"),  y = Green, fill = "Training Data")) +  
+  geom_boxplot(data = hblue_df, aes(x = factor("T Blue"), y = Blue, fill = "Training Data")) +  
+  geom_boxplot(data = blue_df, aes(x = factor("H Red"), y = Red, fill = "Holdout Data")) +
+  geom_boxplot(data = blue_df, aes(x = factor("H Green"), y = Green, fill = "Holdout Data")) +
+  geom_boxplot(data = blue_df, aes(x = factor("H Blue"), y = Blue, fill = "Holdout Data")) +
+  theme_minimal() +
+  labs(title = "Comparison of Colors for the Tarps",
+       x = "Color",
+       y = "Value", 
+       fill = "Source")
+
+nontarp <- ggplot() +
+  geom_boxplot(data = hnonblue_df, aes(x = factor("T Red"), y = Red, fill = "Training Data")) +
+  geom_boxplot(data = hnonblue_df, aes(x = factor("T Green"), y = Green, fill = "Training Data")) +
+  geom_boxplot(data = hnonblue_df, aes(x = factor("T Blue"), y = Blue, fill = "Training Data")) +  
+  geom_boxplot(data = nonblue_df, aes(x = factor("H Red"), y = Red, fill = "Holdout Data")) +
+  geom_boxplot(data = nonblue_df, aes(x = factor("H Green"), y = Green, fill = "Holdout Data")) +
+  geom_boxplot(data = nonblue_df, aes(x = factor("H Blue"), y = Blue, fill = "Holdout Data")) +
+  theme_minimal() +
+  labs(title = "Comparison of Colors for the Nontarps",
+       x = "Color",
+       y = "Value",
+       fill = "Source")
+
+tarp + nontarp
+```
+
+
+We also noticed that despite the data having the same trend, and the data containing the same Class (e.g., a blue tarp), the ranges in color hue were not as close as we would have thought. This difference could be more explainable in the Non-Blue Tarp data as there are many different images that could be captured. Variance in the hues in the training data occurred, across images classified as Non-Blue Tarp and Blue Tarp. All of these classes (including the vague "Various Non-Tarp") were clumped into the one Non-Tarp class for the sake of this project. But that does not explain the different hues across all three color values, including the hue value for the colors green and blue in the training data observations classified as Blue Tarp, when compared to the Non-Tarp class. 
+
+
+
+```{r boxplots-training-data}
+#| fig.cap: Figure 2. Boxplots of Categorical Variables for Training Data
+#| out.width: 65%
+#| fig.width: 6
+#| fig.height: 4
+#| warning: FALSE
+#| message: FALSE
+
+bp1 = ggplot(haiti_pixels, aes(x = Class, y=Red))+
+  geom_boxplot() +  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+
+bp2 = ggplot(haiti_pixels, aes(x = Class, y=Blue))+
+  geom_boxplot() + theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+
+bp3 = ggplot(haiti_pixels, aes(x = Class, y=Green))+
+  geom_boxplot() +  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+
+bp1 +  bp3 + bp2
+
+```
+
+
+
+```{r boxplots-holdout-data}
+#| fig.cap: Figure 3. Boxplots of Categorical Variables for Holdout Data
+#| out.width: 65%
+#| fig.width: 6
+#| fig.height: 4
+#| warning: FALSE
+#| message: FALSE
+
+
+bp4 = ggplot(total_holdout, aes(x = Class, y=Red))+
+  geom_boxplot() +  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + ylab("B1")
+
+bp5 = ggplot(total_holdout, aes(x = Class, y=Blue))+
+  geom_boxplot() + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + ylab("B3")
+
+bp6 = ggplot(total_holdout, aes(x = Class, y=Green))+
+  geom_boxplot() +  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + ylab("B2")
+
+bp4 +  bp6 + bp5
+
+```
+
+
+Unsurprisingly, the box plots for the training set show the predictor variable with the largest difference between the median values for the blue tarp pixels as compared to non-blue tarp pixels is the Blue variable. The Green variable has the second largest difference between the median values for the two levels of the binary response variable. The Red variable does not have much a difference between the two levels of the binary response variable. The box plots for the holdout set show a similar result: one predictor has a large difference between the two classes, one variable has a smaller difference, and one variable has nearly no difference in the median values for the two classes. Thus, we assigned the colors blue, green, and red to these predictor variables, respectively, as we assumed the training and test sets would reflect similar trends. 
+
+Both the training and holdout datasets are imbalanced. As shown in Figure 4 below, there are significantly more Non_Tarp data points than Blue_Tarp data points. This imbalance is consistent with the nature of data collected. Blue tarps would only represent a small fraction of the aerial images captured. 
+
+
+```{r distribution plots}
+#| fig.cap: Figure 4. Plots of Class Variable Distribution of Training and Holdout Datasets
+#| out.width: 85%
+#| fig.width: 6
+#| fig.height: 4
+#| warning: FALSE
+#| message: FALSE
+
+colors <- c(rep("blue",1), rep("grey",1))
+
+g1 = ggplot(haiti_pixels, aes(x = Class))+
+  geom_histogram(stat = 'count',fill = colors) +  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  ylab("Count") + ggtitle("Training Dataset")
+
+g2 = ggplot(total_holdout, aes(x = Class))+
+  geom_histogram(stat = 'count',fill = colors) + theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  ylab("Count") + ggtitle("Holdout Dataset")
+
+g1 + g2
+```
+
+
+### III. Description of Methodology
+
+To build our statistical models, our team utilized the software R and tidy packages, tidymodels and tidyverse. 
+
+We used three different model approaches for this classification problem: logistic regression, linear discriminant analysis (LDA), and quadratic discriminant analysis (QDA). Each model was built and trained on the training dataset with the Class variable as the response and the Red, Green, and Blue variables as the predictors. These models were then tested using the holdout dataset. 
+
+In order to evaluate the performance of each model, we utilized ROC curves, confusion matrices, and model metrics. The model metrics we evaluated were accuracy, true positive rate (TPR)/sensitivity, false positive rate (FPR), precision, ROC AUC, and F-measure.
+
+Due to the nature of this project, we want to ensure that the displaced people in Haiti with blue tarp temporary shelters are not improperly missed by our models and resources, such as rescue workers' time, are not wasted by going to areas that do not have people in need. We put an emphasis on the F-measure and sensitivity when evaluating the model metrics since decreasing the false negative rate and maintaining precision is vital. 
+
+We also needed to check if our models were overfitting the training dataset. In order to do this we performed a 10-fold cross validation and compared the model metrics between the training and holdout datasets. We ensured there were no major discrepancies between the cross validation results and model metrics using the holdout dataset when compared to the results and metrics of the model using the training dataset. 
+
+Since we are working with an imbalanced dataset we explored adjusting the threshold of each model in order to improve model performance. Lowering the threshold makes it less difficult for an observation to be classified as a blue tarp. Therefore, we would expect lowering the threshold to result in a lower false negative rate and a higher true positive rate. The goal of this project is to save human lives by correctly classifying blue tarps, so our models should reduce the false negative rate to minimize the number of displaced people that the model fails to recognize. Adjusting the threshold helps account for the imbalance and make the models more sensitive to the minority class, reducing the false negative rate. The F-measure is useful for imbalanced datasets since it takes into account both precision and recall. We chose thresholds where the F-measure was maximized.
+
+Although accuracy is often used to assess model performance, it can be misleading in imbalanced classification problems because models that solely predict the majority class can still achieve a high level of accuracy. However, such a model would be of no use in predicting the minority class. If a model classified all observations in the holdout set as "Non_Tarp", the accuracy would be high, 98%. However, the model would not identify any pixels as containing blue tarps, which would not aid relief workers in identifying where to find displaced people. 
+
+
+### IV. Results
+
+In order to identify a statistical model that efficiently and accurately recognizes the location of blue tarps in aerial imagery, three models were built and fit. An additional null model was fit to serve as a reference comparison.
+
+To fit the models, a random seed of 1 was set in R. Initial workflows were built for the models and model performance was assessed using a variety of metrics, including accuracy, kappa, F-measure, and the area under the ROC curve (AUC).
+
+Table 1 and Figure 5 below summarize the performance of the classification models before any threshold selection. The ROC AUC values are high (close to 1) and similar for the logistic regression, linear discriminant analysis (LDA), and quadratic discriminant analysis (QDA) models, particularly in comparison to the null model. The ROC AUC of the logistic regression model is slightly larger than the other two models. Based on only this metric, we would select the logistic regression model as the best model. 
+
+```{r model fit no threshold, include = FALSE}
+#| warning: FALSE
+#| message: FALSE
+set.seed(1)
+formula <- `Class` ~ . 
+
+#Approach to fit models WITHOUT cross validation
+reference_model <- null_model(mode="classification") %>%
+    set_engine("parsnip") %>%
+    fit(formula, haiti_pixels)
+
+logreg_model <- logistic_reg(mode="classification", engine="glm") %>%
+    fit(formula, haiti_pixels)
+
+lda_model <- discrim_linear(mode="classification", engine="MASS") %>%
+    fit(formula, haiti_pixels)
+
+qda_model <- discrim_quad(mode="classification", engine="MASS") %>%
+    fit(formula, haiti_pixels)
+
+predictions_ref <- reference_model %>% augment(total_holdout)
+predictions_log <- logreg_model %>% augment(total_holdout)
+predictions_lda <- lda_model %>% augment(total_holdout)
+predictions_qda <- qda_model %>% augment(total_holdout)
+```
+
+```{r metrics-table-no-threshold, echo = FALSE}
+#| warning: FALSE
+#| message: FALSE
+custom_metrics <- yardstick::metric_set(accuracy, f_meas, sens,spec, kap)
+
+#Function to calculate metrics across four models 
+calculate_metrics <- function(model, train, test, model_name) {
+  bind_rows(
+  # bind_cols(
+  #   #Accuracy and Kap
+  #   model=model_name,
+  #   dataset="Train",
+  #   metrics(model %>% augment(haiti_pixels), truth=Class, estimate=.pred_class),
+  #   ),
+  bind_cols(
+    #F Measure
+    model=model_name,
+    dataset="Train",
+    custom_metrics(model %>% augment(haiti_pixels), truth=Class, estimate=.pred_class),
+    ),
+    # AUC of ROC curve of training set
+  bind_cols(
+    model=model_name,
+    dataset="Train",
+    roc_auc(model %>% augment(haiti_pixels), truth=Class, .pred_Blue_Tarp, event_level="first"),
+        ),
+  # bind_cols(
+  #   model=model_name,
+  #   dataset="Test",
+  #   metrics(model %>% augment(total_holdout), truth=Class, 
+  #           estimate=.pred_class)),
+   bind_cols(
+    #F Measure
+    model=model_name,
+    dataset="Test",
+    custom_metrics(model %>% augment(total_holdout), truth=Class, estimate=.pred_class),
+    ),
+    # AUC of ROC curve of holdout set
+    bind_cols(
+    model=model_name,
+    dataset="Test",
+    roc_auc(model %>% augment(total_holdout), truth=Class, .pred_Blue_Tarp,
+            event_level="first")
+    ),
+  )}
+
+#Function to create table
+metrics_table <- function(model_metrics, caption) {
+  model_metrics %>%
+    pivot_wider(names_from=.metric, values_from=.estimate) %>%
+      select(-.estimator) %>%
+        knitr::kable(caption=caption, digits=3) %>%
+          kableExtra::kable_styling(full_width=FALSE)}
+
+all_metrics <- bind_rows(
+  calculate_metrics(reference_model, haiti_pixels, total_holdout, "Reference"),
+  calculate_metrics(logreg_model, haiti_pixels, total_holdout, "Logistic Regression"),
+  calculate_metrics(lda_model, haiti_pixels, total_holdout, "LDA"),
+  calculate_metrics(qda_model, haiti_pixels, total_holdout, "QDA"),
+)
+
+#Output table for models WITHOUT cross-validation approach
+all_metrics <- all_metrics %>% arrange(dataset)
+metrics_table(all_metrics, "Table 1. Metrics for the Classification Models (No Threshold Selection)")
+```
+
+```{r metrics-graph}
+#| warning: FALSE
+#| message: FALSE
+#| fig.cap: Figure 5. Metrics of the Classification Models Using the Training and the Holdout Datasets
+#| fig.width: 10
+#| fig.height: 5
+#| out.width: 100%
+ggplot(all_metrics, aes(x=.estimate, y=model, color=dataset)) +
+    geom_point() +
+    facet_wrap(~ .metric, scale="free_x") +
+    xlab("Metric Estimate") + ylab("Model") + labs(color = "Dataset")
+```
+
+However, looking at accuracy, the QDA model performs the best on the training and test data. Of note, the kappa value for all three models is significantly lower for the test data than the training data, which indicates possible overfitting, as the observed accuracy as compared to random chance (reference model) is higher on the test data.
+
+Finally, the F-measure value is the highest for the QDA model. Since F1 is a measure of both precision and sensitivity/recall, the F-measure value for QDA, 0.714, indicates a useful model. The QDA model demonstrated high precision and sensitivity in identifying displaced individuals under blue tarps. Precision refers to the proportion of true blue tarp pixels accurately classified as displaced persons, while sensitivity reflects the proportion of true displaced person pixels correctly identified, including those misclassified as non-tarp pixels.
+
+```{r ROC-curves-nothreshold}
+#| fig.cap: Figure 6. ROC Curve on Train and Test Data for Each Classification Model
+#| out.width: 90%
+#| fig.width: 10
+#| fig.height: 8
+#| warning: FALSE
+#| message: FALSE
+
+get_roc_plot <- function(model, data, model_name) {
+    roc_data <- model %>%
+        augment(data) %>%
+        roc_curve(truth=Class, .pred_Blue_Tarp, event_level="first")
+    g <- autoplot(roc_data) +
+        labs(title=model_name)
+    return(g)
+}
+
+g5 <- get_roc_plot(reference_model, haiti_pixels, "Null Model - Train")
+g6 <- get_roc_plot(logreg_model, haiti_pixels, "Logistic Regression - Train")
+g7 <- get_roc_plot(lda_model, haiti_pixels, "LDA - Train")
+g8 <- get_roc_plot(qda_model, haiti_pixels, "QDA - Train")
+#(g5 + g6) / (g7 + g8)
+
+g1 <- get_roc_plot(reference_model, total_holdout, "Null Model - Test")
+g2 <- get_roc_plot(logreg_model, total_holdout, "Logistic Regression - Test")
+g3 <- get_roc_plot(lda_model, total_holdout, "LDA - Test")
+g4 <- get_roc_plot(qda_model, total_holdout, "QDA - Test")
+# {g5 + g1 + g6 + g2+ plot_layout(ncol = 4,widths = c(2,2,2,2))} / 
+#   {g7 + g3+g8 + g4 + plot_layout(ncol = 4,widths = c(2,2,2,2))}
+{g6 + g7 + g8+ plot_layout(ncol = 3,widths = c(2,2,2))} / 
+  {g2 + g3 + g4 + plot_layout(ncol = 3,widths = c(2,2,2))}
+```
+
+
+Figure 6 shows a comparison of the model ROC AUC values for the model fit with the training data. In this case, the logistic model has the highest AUCa value. Figure 7 and 8 below shows another comparison of the model ROC AUC values of the model on the train and test data, clearly showing that the logistic regression model performs slightly better than the other two classification models and the reference model for this metric.
+
+```{r ROC-curves-overlaid-train}
+#| fig.cap: Figure 7. ROC Curve Comparison on Train Data
+#| out.width: 75%
+#| fig.width: 6
+#| fig.height: 6
+#| warning: FALSE
+#| message: FALSE
+predictions1 <- reference_model %>% augment(haiti_pixels)
+predictions2 <- logreg_model %>% augment(haiti_pixels)
+predictions3 <- lda_model %>% augment(haiti_pixels)
+predictions4 <- qda_model %>% augment(haiti_pixels)
+
+reference_model_roc = roc(predictions1$Class, predictions1$.pred_Blue_Tarp)
+logreg_model_roc = roc(predictions2$Class, predictions2$.pred_Blue_Tarp)
+lda_model_roc = roc(predictions3$Class, predictions3$.pred_Blue_Tarp)
+qda_model_roc = roc(predictions4$Class, predictions4$.pred_Blue_Tarp)
+
+plot(reference_model_roc, col="blue", legacy.axes = TRUE, print.auc = TRUE, print.auc.y=0.9,print.auc.x = 0.8)
+plot(logreg_model_roc, add =TRUE, col = "green", print.auc = TRUE, print.auc.y=0.8,print.auc.x = 0.8)
+plot(lda_model_roc, add =TRUE, col = "red", print.auc = TRUE, print.auc.y=0.7,print.auc.x = 0.8)
+plot(qda_model_roc, add =TRUE, col = "purple", print.auc = TRUE, print.auc.y=0.6,print.auc.x = 0.8)
+legend("bottomright",
+       legend = c("Reference Model", "Logistic Regression", "LDA", "QDA"),
+       col = c("blue", "green", "red", "purple"),
+       lwd = 2,
+       cex = 0.8)
+```
+
+```{r ROC-curves-overlaid-test}
+#| fig.cap: Figure 8. ROC Curve Comparison on Test Data
+#| out.width: 75%
+#| fig.width: 6
+#| fig.height: 6
+#| warning: FALSE
+#| message: FALSE
+predictions1 <- reference_model %>% augment(total_holdout)
+predictions2 <- logreg_model %>% augment(total_holdout)
+predictions3 <- lda_model %>% augment(total_holdout)
+predictions4 <- qda_model %>% augment(total_holdout)
+
+reference_model_roc = roc(predictions1$Class, predictions1$.pred_Blue_Tarp)
+logreg_model_roc = roc(predictions2$Class, predictions2$.pred_Blue_Tarp)
+lda_model_roc = roc(predictions3$Class, predictions3$.pred_Blue_Tarp)
+qda_model_roc = roc(predictions4$Class, predictions4$.pred_Blue_Tarp)
+
+plot(reference_model_roc, col="blue", legacy.axes = TRUE, print.auc = TRUE, print.auc.y=0.9,print.auc.x = 0.8)
+plot(logreg_model_roc, add =TRUE, col = "green", print.auc = TRUE, print.auc.y=0.8,print.auc.x = 0.8)
+plot(lda_model_roc, add =TRUE, col = "red", print.auc = TRUE, print.auc.y=0.7,print.auc.x = 0.8)
+plot(qda_model_roc, add =TRUE, col = "purple", print.auc = TRUE, print.auc.y=0.6,print.auc.x = 0.8)
+legend("bottomright",
+       legend = c("Reference Model", "Logistic Regression", "LDA", "QDA"),
+       col = c("blue", "green", "red", "purple"),
+       lwd = 2,
+       cex = 0.8)
+```
+
+To check that our models were not overfitting the training dataset, we performed a 10-fold cross validation on the dataset. The results of the cross validation are below in Table 2 and Figure 9. Figure 9 above shows a comparison of the ROC AUC curves for each model between the cross validation results in black and the training data results in red. We ensured there were no major discrepancies between the cross validation results and model metrics using the holdout dataset when compared to the results and metrics of the model using the training dataset. The cross validation metrics are very similar to the training set metrics. All three ROC curves from the training and cross validation datasets look very similar. This indicates that the model is not overfitting the data. 
+
+```{r cross-validation, include = FALSE}
+#| warning: FALSE
+#| message: FALSE
+set.seed(1)
+formula <- `Class` ~ . 
+
+#Approach to fit models WITH cross validation
+
+cv_data <- rbind(haiti_pixels,total_holdout)
+
+#Recipe
+recipe <- recipe(formula, data=cv_data) %>%
+step_normalize(all_numeric_predictors())
+
+#Models
+logreg_spec <- logistic_reg(mode="classification", engine="glm")
+lda_spec <- discrim_linear(mode="classification", engine="MASS")
+qda_spec <- discrim_quad(mode="classification", engine="MASS")
+
+#Workflow
+logreg_wf <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(logreg_spec)
+
+lda_wf <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(lda_spec)
+
+qda_wf <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(qda_spec)
+
+#Cross validation approach
+resamples <- vfold_cv(cv_data, v=10, strata=Class)
+custom_metrics <- metric_set(roc_auc, accuracy)
+cv_control <- control_resamples(save_pred=TRUE)
+
+custom_metrics2 <- yardstick::metric_set(f_meas, accuracy, kap,roc_auc)
+
+#Cross Validation
+ logreg_cv <- fit_resamples(logreg_wf, resamples, metrics=custom_metrics2, control=cv_control)
+ lda_cv <- fit_resamples(lda_wf, resamples, metrics=custom_metrics2, control=cv_control)
+ qda_cv <- fit_resamples(qda_wf, resamples, metrics=custom_metrics2, control=cv_control)
+```
+
+```{r cv-metrics-nothreshold, echo = FALSE}
+#| warning: FALSE
+#| message: FALSE
+#Metrics associated with CV training
+ cv_metrics <- bind_rows(
+     collect_metrics(logreg_cv) %>%
+         mutate(model="Logistic Regression")%>% 
+         mutate(threshold = "No Threshold"),
+     collect_metrics(lda_cv) %>%
+         mutate(model="LDA")%>% 
+         mutate(threshold = "No Threshold"),
+     collect_metrics(qda_cv) %>%
+         mutate(model="QDA") %>% 
+         mutate(threshold = "No Threshold")
+ )
+  
+ cv_metrics %>%
+     dplyr::select(model,threshold, .metric, mean) %>%
+     pivot_wider(names_from=".metric", values_from="mean") %>%
+     knitr::kable(caption="Table 2. Metrics for the Cross Validation Classification Models (No Threshold Selection)", digits=3) %>%
+     kableExtra::kable_styling(full_width=FALSE)
+```
+
+```{r cv-roc-curves-nothreshold}
+#| fig.cap: Figure 9. ROC Curve from Cross Validation for Each Classification Model
+#| out.width: 90%
+#| fig.width: 10
+#| fig.height: 4
+#| warning: FALSE
+#| message: FALSE
+
+ #Predictions for Cross Validation ROC Curves
+ cv_predictions_logreg <- collect_predictions(logreg_cv)
+ cv_predictions_lda <- collect_predictions(lda_cv)
+ cv_predictions_qda <- collect_predictions(qda_cv)
+  
+ #ROC for cross-validation logreg
+ create_roc_curves_cv = function(model1, model2,model_name){
+   cv_roc <- model1 %>%
+     roc_curve(truth=Class, .pred_Blue_Tarp, event_level = "first")
+    
+ #ROC for regular training data logreg
+ ontrain_roc <- augment(model2, new_data=haiti_pixels) %>%
+     roc_curve(truth=Class, .pred_Blue_Tarp, event_level = "first")
+   ggplot() +
+     geom_path(data=cv_roc, aes(x=1 - specificity, y=sensitivity)) +
+      geom_path(data=ontrain_roc, aes(x=1 - specificity, y=sensitivity), color="red") +
+      geom_abline(lty=2)+
+          labs(title=model_name)
+  }
+  
+  
+  cv1 = create_roc_curves_cv(cv_predictions_logreg , logreg_model,"Logistic Regression")
+  cv2 = create_roc_curves_cv(cv_predictions_lda, lda_model,"LDA")
+  cv3 = create_roc_curves_cv(cv_predictions_qda , qda_model,"QDA")
+  
+  {cv1 + cv2 + cv3 + plot_layout(ncol = 3,widths = c(3,3,3))}
+```
+
+Figure 10 below overlays the ROC AUC curves for a comparison, for the models fitted on the 10-fold cross validation samples. Similar to the ROC AUC values fitted on the training and test set, the logistic regression model had the highest AUC ROC value. 
+
+```{r cv-ROC-curves-overlaid-nothreshold}
+ #| fig.cap: Figure 10. ROC Curve Comparison on Cross Validation
+ #| out.width: 75%
+ #| fig.width: 6
+ #| fig.height: 6
+ #| warning: FALSE
+ #| message: FALSE
+ predictions1 <- reference_model %>% augment(total_holdout)
+ 
+ reference_model_roc = roc(predictions1$Class, predictions1$.pred_Blue_Tarp)
+ logreg_model_roc = roc(cv_predictions_logreg$Class, cv_predictions_logreg$.pred_Blue_Tarp)
+ lda_model_roc = roc(cv_predictions_lda$Class, cv_predictions_lda$.pred_Blue_Tarp)
+ qda_model_roc = roc(cv_predictions_qda$Class, cv_predictions_qda$.pred_Blue_Tarp)
+ 
+ plot(reference_model_roc, col="blue", legacy.axes = TRUE, print.auc = TRUE, print.auc.y=0.9,print.auc.x = 0.8)
+ plot(logreg_model_roc, add =TRUE, col = "green", print.auc = TRUE, print.auc.y=0.8,print.auc.x = 0.8)
+ plot(lda_model_roc, add =TRUE, col = "red", print.auc = TRUE, print.auc.y=0.7,print.auc.x = 0.8)
+ plot(qda_model_roc, add =TRUE, col = "purple", print.auc = TRUE, print.auc.y=0.6,print.auc.x = 0.8)
+ legend("bottomright",
+        legend = c("Reference Model", "Logistic Regression", "LDA", "QDA"),
+        col = c("blue", "green", "red", "purple"),
+        lwd = 2,
+        cex = 0.8)
+```
+
+```{r cv-threshold}
+#| warning: FALSE
+#| message: FALSE
+ #Define function to identify threshold for CV models
+ threshold_cv <- function(model_predictions_cv) {
+     performance <- model_predictions_cv %>% 
+       probably::threshold_perf(Class, .pred_Blue_Tarp,
+         thresholds=seq(0.05, 0.95, 0.05), event_level="first",
+         metrics=metric_set(f_meas))
+     max_metrics <- performance %>%
+         drop_na() %>%
+         group_by(.metric) %>%
+         filter(.estimate == max(.estimate))
+     threshold <- max_metrics %>%
+         select(.metric, .threshold) %>%
+         deframe()
+     return(threshold=threshold)
+ }
+ 
+ # Use function to define threshold for CV models
+ logreg_cv_threshold <- threshold_cv(cv_predictions_logreg)
+ lda_cv_threshold <- threshold_cv(cv_predictions_lda)
+ qda_cv_threshold <- threshold_cv(cv_predictions_qda)
+ 
+ logreg_cv_predict_threshold <- cv_predictions_logreg %>%
+     mutate(.pred_class = factor(ifelse(.pred_Blue_Tarp >= logreg_cv_threshold, "Blue_Tarp", "Non_Tarp")))
+ lda_cv_predict_threshold <- cv_predictions_lda %>%
+     mutate(.pred_class = factor(ifelse(.pred_Blue_Tarp >= lda_cv_threshold, "Blue_Tarp", "Non_Tarp")))
+ qda_cv_predict_threshold <- cv_predictions_qda%>%
+     mutate(.pred_class = factor(ifelse(.pred_Blue_Tarp >= qda_cv_threshold, "Blue_Tarp", "Non_Tarp")))
+```
+
+In order to address the imbalance in our dataset, we performed a threshold selection analysis. Table 3 and Figure 11 below are the results of the analysis. Figure 11 shows a comparison of the ROC AUC curves for each model between the cross validation results with the selected threshold in black and the training data results in red. By optimizing the threshold, our models become more sensitive to the minority class, Blue_Tarps, reducing the false negative rate. We chose thresholds where the F-measure was maximized since the metric takes into account both precision and recall. The F-measure improved for some of the models in Table 3 compared to those in Table 2. 
+
+```{r metrics-table-cv-with-threshold, echo = FALSE}
+#| warning: FALSE
+#| message: FALSE
+ custom_metrics <- yardstick::metric_set(accuracy, f_meas, sens, spec, kap)
+ 
+ #Function to calculate CV metrics across four models 
+ calculate_metrics_cv <- function(model_cv, model_name, threshold) {
+   bind_rows(
+   bind_cols(
+     #F Measure
+     model=model_name,
+     threshold = threshold,
+     dataset="CV",
+     custom_metrics(model_cv, truth=Class, estimate=.pred_class),
+     ),
+     # AUC of ROC curve
+     bind_cols(
+     model=model_name,
+     threshold = threshold,
+     dataset="CV",
+     roc_auc(model_cv, truth=Class, .pred_Blue_Tarp, event_level="first"),
+         )
+   )}
+ 
+ # CV metrics at threshold
+ every_metric_cv <- bind_rows(
+   calculate_metrics_cv(logreg_cv_predict_threshold, "Logistic regression", logreg_cv_threshold),
+   calculate_metrics_cv(lda_cv_predict_threshold, "LDA", lda_cv_threshold),
+   calculate_metrics_cv(qda_cv_predict_threshold, "QDA", qda_cv_threshold)
+ )
+ 
+ every_metric_cv %>%
+   select(-.estimator) %>% 
+   pivot_wider(names_from=".metric", values_from=".estimate") %>%
+   knitr::kable(digits=3, caption="Table 3. Metrics for the Cross Validation Classification Models (With Threshold Selection)") %>%
+     kableExtra::kable_styling(full_width=FALSE)
+```
+
+```{r cv-roc-curves-threshold}
+#| fig.cap: Figure 11. ROC Curve from Cross Validation for Each Classification Model with Threshold Selection
+#| out.width: 90%
+#| fig.width: 10
+#| fig.height: 4
+#| warning: FALSE
+#| message: FALSE
+ #ROC for CV at Threshold
+ create_roc_curves_cv = function(model1, model2,model_name){
+   cv_roc <- model1 %>%
+     roc_curve(truth=Class, .pred_Blue_Tarp, event_level = "first")
+    
+ #ROC for regular training data logreg
+ ontrain_roc <- augment(model2, new_data=haiti_pixels) %>%
+     roc_curve(truth=Class, .pred_Blue_Tarp, event_level = "first")
+   ggplot() +
+     geom_path(data=cv_roc, aes(x=1 - specificity, y=sensitivity)) +
+      geom_path(data=ontrain_roc, aes(x=1 - specificity, y=sensitivity), color="red") +
+      geom_abline(lty=2)+
+          labs(title=model_name)
+  }
+  
+ cv1thrsh = create_roc_curves_cv(logreg_cv_predict_threshold , logreg_model,"Logistic Regression")
+ cv2thrsh = create_roc_curves_cv(lda_cv_predict_threshold, lda_model,"LDA")
+ cv3thrsh = create_roc_curves_cv(qda_cv_predict_threshold , qda_model,"QDA")
+  
+  {cv1thrsh + cv2thrsh + cv3thrsh + plot_layout(ncol = 3,widths = c(3,3,3))}
+```
+
+```{r ROC-curves-overlaid-threshold-cv}
+#| fig.cap: Figure 12. ROC Curve Comparison on Cross Validation at Threshold Selection
+#| out.width: 75%
+#| fig.width: 6
+#| fig.height: 6
+#| warning: FALSE
+#| message: FALSE
+ predictions1 <- reference_model %>% augment(total_holdout)
+
+ reference_model_roc = roc(predictions1$Class, predictions1$.pred_Blue_Tarp)
+ logreg_model_roc = roc(logreg_cv_predict_threshold$Class, logreg_cv_predict_threshold$.pred_Blue_Tarp)
+ lda_model_roc = roc(lda_cv_predict_threshold$Class, lda_cv_predict_threshold$.pred_Blue_Tarp)
+ qda_model_roc = roc(qda_cv_predict_threshold$Class, qda_cv_predict_threshold$.pred_Blue_Tarp)
+ 
+ plot(reference_model_roc, col="blue", legacy.axes = TRUE, print.auc = TRUE, print.auc.y=0.9,print.auc.x = 0.8)
+ plot(logreg_model_roc, add =TRUE, col = "green", print.auc = TRUE, print.auc.y=0.8,print.auc.x = 0.8)
+ plot(lda_model_roc, add =TRUE, col = "red", print.auc = TRUE, print.auc.y=0.7,print.auc.x = 0.8)
+ plot(qda_model_roc, add =TRUE, col = "purple", print.auc = TRUE, print.auc.y=0.6,print.auc.x = 0.8)
+ legend("bottomright",
+        legend = c("Reference Model", "Logistic Regression", "LDA", "QDA"),
+        col = c("blue", "green", "red", "purple"),
+        lwd = 2,
+        cex = 0.8)
+```
+
+In order to address the imbalance in our dataset, we performed a threshold selection analysis. Figure 13 and Table 4 below are the results of the analysis. By adjusting the threshold, our models become more sensitive to the minority class, Blue_Tarps, reducing the false negative rate. We chose thresholds where the F-measure was maximized since the metric takes into account both precision and recall. For the LDA model, Figure 13 shows that there is no significant change in the F-measure value as the threshold value varies. This is likely why the LDA model has a higher threshold value of 0.84, when compared to the logistic regression threshold (0.21) and the QDA threshold value (0.22) that maximizes the F-measure. 
+
+```{r threshold-scan}
+#| fig.cap: Figure 13. Threshold Scan of Each Classification Model using the F-Measure
+#| out.width: 90%
+#| fig.width: 10
+#| fig.height: 4
+#| warning: FALSE
+#| message: FALSE
+threshold_scan <- function(model, data, model_name) {
+    threshold_data <- model %>%
+        augment(data) %>%
+        probably::threshold_perf(Class, .pred_Blue_Tarp,
+            thresholds=seq(0.05, 0.95, 0.01), event_level="first",
+            metrics=metric_set(f_meas))
+    opt_threshold <- threshold_data %>%
+        arrange(-.estimate) %>%
+        first()
+    g <- ggplot(threshold_data, aes(x=.threshold, y=.estimate)) +
+        geom_line() +
+        geom_point(data=opt_threshold, color="red", size=2) +
+        labs(title=model_name, x="Threshold", y="F Measure") +
+        coord_cartesian(ylim=c(0.2, 1))
+    return(list(
+        graph=g,
+        threshold=opt_threshold %>%
+            pull(.threshold)
+    ))
+}
+
+g1 <- threshold_scan(logreg_model, haiti_pixels, "Logistic Regression")
+g2 <- threshold_scan(lda_model, haiti_pixels, "LDA")
+g3 <- threshold_scan(qda_model, haiti_pixels, "QDA")
+
+logreg_threshold <- g1$threshold
+lda_threshold <- g2$threshold
+qda_threshold <- g3$threshold
+
+g1$graph + g2$graph + g3$graph + plot_layout(ncol = 3,widths = c(3,3,3))
+```
+
+```{r threshold-metrics}
+#| fig.width: 12
+#| fig.height: 4
+#| out.width: 75%
+#| warning: FALSE
+#| message: FALSE
+
+custom_metrics1 <- yardstick::metric_set(f_meas)
+
+#f_val1 = custom_metrics1(predictions_ref, truth=Class, estimate=.pred_class)
+f_val2 = custom_metrics1(predictions_log, truth=Class, estimate=.pred_class)
+f_val3 = custom_metrics1(predictions_lda, truth=Class, estimate=.pred_class)
+f_val4 = custom_metrics1(predictions_qda, truth=Class, estimate=.pred_class)
+
+#metrics = as.data.frame(rbind(f_val1, f_val2, f_val3, f_val4))
+metrics = as.data.frame(rbind(f_val2, f_val3, f_val4))
+
+#metrics$names = c("Reference", "Logistic Regression", "LDA", "QDA")
+metrics$model = c("Logistic Regression", "LDA", "QDA")
+metrics$threshold = rbind(logreg_threshold,lda_threshold,qda_threshold)
+
+metrics %>%
+    dplyr::select(model, .metric, threshold,.estimate) %>%
+    pivot_wider(names_from=".metric", values_from=".estimate") %>%
+    knitr::kable(caption="Table 4. F-Measure at Threshold", digits=3) %>%
+    kableExtra::kable_styling(full_width=FALSE)
+```
+
+Once the threshold selection analysis was complete, we re-ran each of the classification models using these thresholds. The ROC AUC and accuracy of all three models are high and there is minimal deviation between the metrics for the test and train datasets. Based on these metrics, the logistic regression model performs the best on test data. This is slightly different from the models with no threshold selection where the QDA model outperformed logistic regression based on accuracy. 
+
+When evaluating the three models based on the F-measure the QDA model performs the best on the test data. This is consistent with our model evaluation with no threshold selection. 
+
+```{r model-metrics-threshold}
+#| warning: FALSE
+#| message: FALSE
+predict_at_threshold <- function(model, data, threshold) {
+    return(
+        model %>%
+            augment(data) %>%
+            mutate(.pred_class = factor(make_two_class_pred(.pred_Blue_Tarp,
+                    c("Blue_Tarp", "Non_Tarp"), threshold=threshold), levels = c("Blue_Tarp","Non_Tarp"))
+            )
+    )
+}
+custom_metrics2_7 <- yardstick::metric_set(accuracy,f_meas, sens)
+
+calculate_metrics_at_threshold <- function(model, train, holdout, model_name, threshold) {
+    bind_rows(
+        # Accuracy of training set
+        bind_cols(
+            model=model_name, dataset="train", threshold=threshold,
+            custom_metrics2_7(predict_at_threshold(model, train, threshold), truth=Class, estimate=.pred_class),
+        ),
+        # AUC of ROC curve of training set
+        bind_cols(
+            model=model_name, dataset="train", threshold=threshold,
+            roc_auc(model %>% augment(haiti_pixels), Class, .pred_Blue_Tarp, event_level="first"),
+        ),
+        # Accuracy of holdout set
+        bind_cols(
+            model=model_name, dataset="holdout", threshold=threshold,
+            custom_metrics2_7(predict_at_threshold(model, holdout, threshold), truth=Class, estimate=.pred_class),
+        ),
+        # AUC of ROC curve of holdout set
+        bind_cols(
+            model=model_name, dataset="holdout", threshold=threshold,
+            roc_auc(model %>% augment(total_holdout), Class, .pred_Blue_Tarp, event_level="first"),
+        ),
+    )
+}
+
+metrics_table <- function(all_metrics, caption) {
+    all_metrics %>%
+        pivot_wider(names_from=.metric, values_from=.estimate) %>%
+        select(-.estimator) %>%
+        knitr::kable(caption=caption, digits=3) %>%
+        kableExtra::kable_styling(full_width=FALSE)
+}
+
+logreg_train_predict <- predict_at_threshold(logreg_model, haiti_pixels, logreg_threshold)
+logreg_test_predict <- predict_at_threshold(logreg_model, total_holdout, logreg_threshold)
+lda_train_predict <- predict_at_threshold(lda_model, haiti_pixels, lda_threshold)
+lda_test_predict <- predict_at_threshold(lda_model, total_holdout, lda_threshold)
+qda_train_predict <- predict_at_threshold(qda_model, haiti_pixels, qda_threshold)
+qda_test_predict <- predict_at_threshold(qda_model, total_holdout, qda_threshold)
+
+calculate_roc_at_threshold <- function(model, data, threshold) {
+    bind_rows(
+        # AUC of ROC curve of training set
+        bind_cols(
+            threshold=threshold,
+            roc_auc(model %>% augment(data), Class, .pred_Blue_Tarp, event_level="first"),
+        ),
+    )
+}
+
+lrm_train_roc <- calculate_roc_at_threshold(logreg_model, haiti_pixels, logreg_threshold)
+lda_train_roc <- calculate_roc_at_threshold(lda_model, haiti_pixels, lda_threshold)
+qda_train_roc <- calculate_roc_at_threshold(qda_model, haiti_pixels, qda_threshold)
+lrm_test_roc <- calculate_roc_at_threshold(logreg_model, total_holdout, logreg_threshold)
+lda_test_roc <- calculate_roc_at_threshold(lda_model, total_holdout, lda_threshold)
+qda_test_roc <- calculate_roc_at_threshold(qda_model, total_holdout, qda_threshold)
+
+lrm_train_cm <- confusionMatrix(data = logreg_train_predict$.pred_class, reference = haiti_pixels$Class)
+lrm_train_accuracy <- lrm_train_cm$overall["Accuracy"]
+lrm_train_tpr <- lrm_train_cm$byClass["Sensitivity"]
+lrm_train_fpr <- 1 - lrm_train_cm$byClass["Specificity"]
+lrm_train_precision <- lrm_train_cm$byClass["Precision"]
+lrm_train_f1_score <- lrm_train_cm$byClass["F1"]
+
+lrm_test_cm <- confusionMatrix(data = logreg_test_predict$.pred_class, reference = total_holdout$Class)
+lrm_test_accuracy <- lrm_test_cm$overall["Accuracy"]
+lrm_test_tpr <- lrm_test_cm$byClass["Sensitivity"]
+lrm_test_fpr <- 1 - lrm_test_cm$byClass["Specificity"]
+lrm_test_precision <- lrm_test_cm$byClass["Precision"]
+lrm_test_f1_score <- lrm_test_cm$byClass["F1"]
+
+lda_train_cm <- confusionMatrix(data = lda_train_predict$.pred_class, reference = haiti_pixels$Class)
+lda_train_accuracy <- lda_train_cm$overall["Accuracy"]
+lda_train_tpr <- lda_train_cm$byClass["Sensitivity"]
+lda_train_fpr <- 1 - lda_train_cm$byClass["Specificity"]
+lda_train_precision <- lda_train_cm$byClass["Precision"]
+lda_train_f1_score <- lda_train_cm$byClass["F1"]
+
+lda_test_cm <- confusionMatrix(data = lda_test_predict$.pred_class, reference = total_holdout$Class)
+lda_test_accuracy <- lda_test_cm$overall["Accuracy"]
+lda_test_tpr <- lda_test_cm$byClass["Sensitivity"]
+lda_test_fpr <- 1 - lda_test_cm$byClass["Specificity"]
+lda_test_precision <- lda_test_cm$byClass["Precision"]
+lda_test_f1_score <- lda_test_cm$byClass["F1"]
+
+qda_train_cm <- confusionMatrix(data = qda_train_predict$.pred_class, reference = haiti_pixels$Class)
+qda_train_accuracy <- qda_train_cm$overall["Accuracy"]
+qda_train_tpr <- qda_train_cm$byClass["Sensitivity"]
+qda_train_fpr <- 1 - qda_train_cm$byClass["Specificity"]
+qda_train_precision <- qda_train_cm$byClass["Precision"]
+qda_train_f1_score <- qda_train_cm$byClass["F1"]
+
+qda_test_cm <- confusionMatrix(data = qda_test_predict$.pred_class, reference = total_holdout$Class)
+qda_test_accuracy <- qda_test_cm$overall["Accuracy"]
+qda_test_tpr <- qda_test_cm$byClass["Sensitivity"]
+qda_test_fpr <- 1 - qda_test_cm$byClass["Specificity"]
+qda_test_precision <- qda_test_cm$byClass["Precision"]
+qda_test_f1_score <- qda_test_cm$byClass["F1"]
+
+every_metric <- bind_rows(
+    bind_cols(
+    model="Logistic Regression",
+    dataset="Test",
+    ROC = lrm_test_roc$.estimate,
+    Threshold = logreg_threshold,
+    Accuracy = lrm_test_accuracy,
+    TPR = lrm_test_tpr,
+    FPR  = lrm_test_fpr,
+    Precision = lrm_test_precision,
+    F_meas = lrm_test_f1_score
+      ),
+  bind_cols(
+    model="LDA",
+    dataset="Test",
+    ROC = lda_test_roc$.estimate,
+    Threshold = lda_threshold,
+    Accuracy = lda_test_accuracy,
+    TPR = lda_test_tpr,
+    FPR  = lda_test_fpr,
+    Precision = lda_test_precision,
+    F_meas = lda_test_f1_score
+      ),    
+  bind_cols(
+    model="QDA",
+    dataset="Test",
+    ROC = qda_test_roc$.estimate,
+    Threshold = qda_threshold,
+    Accuracy = qda_test_accuracy,
+    TPR = qda_test_tpr,
+    FPR = qda_test_fpr,
+    Precision = qda_test_precision,
+    F_meas = qda_test_f1_score
+      ),    
+  bind_cols(
+    model="Logistic Regression",
+    dataset="Train",
+    ROC = lrm_train_roc$.estimate,
+    Threshold = logreg_threshold,
+    Accuracy = lrm_train_accuracy,
+    TPR = lrm_train_tpr,
+    FPR  = lrm_train_fpr,
+    Precision = lrm_train_precision,
+    F_meas = lrm_train_f1_score
+      ),
+  bind_cols(
+    model="LDA",
+    dataset="Train",
+    ROC = lda_train_roc$.estimate,
+    Threshold = lda_threshold,
+    Accuracy = lda_train_accuracy,
+    TPR = lda_train_tpr,
+    FPR  = lda_train_fpr,
+    Precision = lda_train_precision,
+    F_meas = lda_train_f1_score
+      ),
+  bind_cols(
+    model="QDA",
+    dataset="Train",
+    ROC = qda_train_roc$.estimate,
+    Threshold = qda_threshold,
+    Accuracy = qda_train_accuracy,
+    TPR = qda_train_tpr,
+    FPR  = qda_train_fpr,
+    Precision = qda_train_precision,
+    F_meas = qda_train_f1_score
+      )
+)
+
+every_metric %>%
+  knitr::kable(digits=3, caption="Table 5. Metrics for the Classification Models (With Threshold Selection)") %>%
+  kableExtra::kable_styling(full_width=FALSE)
+```
+
+The threshold scan for maximizing the F-measure lowered the threshold for logistic regression and QDA and raised the threshold for LDA. As seen in the plot of the threshold against F-measure in Figure 13, the F-measure is relatively constant across all thresholds, so the fact that the selected threshold of 0.84 is higher than the other two models does not seem significant. Comparing the confusion matrices for QDA at a threshold of 0.5 and the selected threshold 0.22, demonstrates the lower threshold resulted in a lower false negative rate. The confusion matrix below at a threshold of 0.5 has a false negative rate of 0.305. The sensitivity, or true positive rate, is 0.694.  
+
+However, after lowering the threshold to 0.22, we see more observations are predicted to be "Blue_Tarp", and the false negative rate lowers to 0.239. The sensitivity (TPR) increases to 0.761. Thus, the lower threshold for the QDA model could lead to more displaced people receiving aid, as fewer blue tarps were not classified as not blue tarps.
+
+Due to limited resources, relief workers might also need to consider the effect lowering the threshold has on the false positive rate. The false positive rate, meaning the proportion of non-blue tarp pixels classified as blue tarps, for the 0.5 threshold confusion matrix is 0.0018. The false positive rate increases to 0.0034 when the threshold is lowered to 0.22. 
+
+```{r confusion-matrix}
+#| fig.cap: Figure 14. Confusion Matrix for Each Model On Holdout Data
+#| out.width: 95%
+#| fig.width: 12
+#| fig.height: 6
+#| warning: FALSE
+#| message: FALSE
+#Confusion Matrix of Test Data
+cm2logreg_test <- predictions2 %>%
+    conf_mat(truth=Class, estimate=.pred_class)
+cm3lda_test <- predictions3 %>%
+    conf_mat(truth=Class, estimate=.pred_class)
+cm4qda_test <- predictions4 %>%
+    conf_mat(truth=Class, estimate=.pred_class)
+
+#Confusion Matrix of Threshold Test Data
+logreg_test_thres_cm <- logreg_test_predict %>% conf_mat(truth=Class, estimate=.pred_class)
+lda_test_thres_cm <- lda_test_predict%>% conf_mat(truth=Class, estimate=.pred_class)
+qda_test_thres_cm <- qda_test_predict%>% conf_mat(truth=Class, estimate=.pred_class)
+
+logreg_precision_test <- cm2logreg_test$table[1]/(cm2logreg_test$table[1]+cm2logreg_test$table[3])
+logreg_fnr_test <- cm2logreg_test$table[2]/(cm2logreg_test$table[1]+cm2logreg_test$table[2])
+lda_precision_test <- cm3lda_test$table[1]/(cm3lda_test$table[1]+cm3lda_test$table[3])
+lda_fnr_test <- cm3lda_test$table[2]/(cm3lda_test$table[1]+cm3lda_test$table[2])
+qda_precision_test <- cm4qda_test$table[1]/(cm4qda_test$table[1]+cm4qda_test$table[3])
+qda_fnr_test <- cm4qda_test$table[2]/(cm4qda_test$table[1]+cm4qda_test$table[2])
+
+Truth <- factor(c('Blue_Tarp', 'Blue_Tarp', 'Non_Tarp', 'Non_Tarp'))
+Prediction <- factor(c('Blue_Tarp', 'Non_Tarp', 'Blue_Tarp', 'Non_Tarp'))
+Ylog <- cm2logreg_test$table
+Ylda <- cm3lda_test$table
+Yqda <- cm4qda_test$table
+dflog <- data.frame(Truth, Prediction, Ylog)
+dflda <- data.frame(Truth, Prediction, Ylda)
+dfqda <- data.frame(Truth, Prediction, Yqda)
+Ylogthres <- logreg_test_thres_cm$table
+Yldathres <- lda_test_thres_cm$table
+Yqdathres <- qda_test_thres_cm$table
+dflogthres <- data.frame(Truth, Prediction, Ylogthres)
+dfldathres <- data.frame(Truth, Prediction, Yldathres)
+dfqdathres <- data.frame(Truth, Prediction, Yqdathres)
+
+cmlog <- ggplot(data =  dflog, mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(aes(fill = Freq), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+  scale_fill_gradient(low = "grey", high = "lightblue") +
+  theme_bw() + theme(legend.position = "none") + ggtitle("Logistic Regression")
+cmlda <- ggplot(data =  dflda, mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(aes(fill = Freq), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+  scale_fill_gradient(low = "grey", high = "lightblue") +
+  theme_bw() + theme(legend.position = "none") + ggtitle("LDA")
+cmqda <- ggplot(data =  dfqda, mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(aes(fill = Freq), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+  scale_fill_gradient(low = "grey", high = "lightblue") +
+  theme_bw() + theme(legend.position = "none") + ggtitle("QDA")
+cmlogthres <- ggplot(data =  dflogthres, mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(aes(fill = Freq), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+  scale_fill_gradient(low = "grey", high = "lightblue") +
+  theme_bw() + theme(legend.position = "none") + ggtitle("Logistic Regression - Adj. Threshold")
+cmldathres <- ggplot(data =  dfldathres, mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(aes(fill = Freq), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+  scale_fill_gradient(low = "grey", high = "lightblue") +
+  theme_bw() + theme(legend.position = "none") + ggtitle("LDA - Adj. Threshold")
+cmqdathres <- ggplot(data =  dfqdathres, mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(aes(fill = Freq), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+  scale_fill_gradient(low = "grey", high = "lightblue") +
+  theme_bw() + theme(legend.position = "none") + ggtitle("QDA - Adj. Threshold")
+
+{cmlog + cmlda + cmqda+ plot_layout(ncol = 3,widths = c(3,3,3))} / 
+  {cmlogthres + cmldathres + cmqdathres + plot_layout(ncol = 3,widths = c(3,3,3))}
+```
+
+In order to further analyze the precision and sensitivity of the models, we investigated the precision and recall curves. The values in Table 6 for the models on the test data indicate that the logistic model had the highest PR AUC value, followed by the QDA model. Figure 15 shows the comparison between these PR AUC curves, in which the models that are performing better (logistic regression and QDA) have a curve that trends towards the upper right hand corner of the visual. 
+
+```{r pr-metric-table}
+#| warning: FALSE
+#| message: FALSE
+pr_auc_value_log <- pr_auc(logreg_test_predict, truth=Class, .pred_Blue_Tarp, event_level="first") 
+pr_auc_value_lda <- pr_auc(lda_test_predict, truth=Class, .pred_Blue_Tarp, event_level="first") 
+pr_auc_value_qda <- pr_auc(qda_test_predict, truth=Class, .pred_Blue_Tarp, event_level="first") 
+
+pr_auc_value_log_train <- pr_auc(logreg_train_predict, truth=Class, .pred_Blue_Tarp, event_level="first") 
+pr_auc_value_lda_train <- pr_auc(lda_train_predict, truth=Class, .pred_Blue_Tarp, event_level="first") 
+pr_auc_value_qda_train <- pr_auc(qda_train_predict, truth=Class, .pred_Blue_Tarp, event_level="first")
+
+pr_auc_metric <- bind_rows(
+  bind_cols(
+    model="Logistic Regression",
+    dataset="Test",
+    PR_AUC = pr_auc_value_log$.estimate
+  ),
+  bind_cols(
+    model="LDA",
+    dataset="Test",
+    PR_AUC = pr_auc_value_lda$.estimate
+  ),    
+  bind_cols(
+    model="QDA",
+    dataset="Test",
+    PR_AUC = pr_auc_value_qda$.estimate
+  ),    
+  bind_cols(
+    model="Logistic Regression",
+    dataset="Train",
+    PR_AUC = pr_auc_value_log_train$.estimate
+  ),
+  bind_cols(
+    model="LDA",
+    dataset="Train",
+    PR_AUC = pr_auc_value_lda_train$.estimate
+  ),
+  bind_cols(
+    model="QDA",
+    dataset="Train",
+    PR_AUC = pr_auc_value_qda_train$.estimate
+  )
+)
+
+pr_auc_metric  %>%
+  knitr::kable(digits=3, caption="Table 6. Precision-Recall AUC for the Classification Models on Train and Test Data") %>%
+  kableExtra::kable_styling(full_width=FALSE)
+```
+
+
+```{r pr-curves}
+#| fig.cap: Figure 15. Precision-Recall Curve on Train and Test Data for Each Classification Model
+#| out.width: 90%
+#| fig.width: 10
+#| fig.height: 8
+#| warning: FALSE
+#| message: FALSE
+get_pr_curve <- function(model,data,model_name) {
+  pr_data <- model %>% 
+    augment(data) %>% 
+    pr_curve(truth = Class,.pred_Blue_Tarp,event_level = "first")
+  g <- autoplot(pr_data) +
+    labs(title = model_name)
+  return(g)
+}
+
+g1 <- get_pr_curve(logreg_model,haiti_pixels,'Logistic Regression - Train')
+g2 <- get_pr_curve(logreg_model,total_holdout,'Logistic Regression - Test')
+g3 <- get_pr_curve(lda_model,haiti_pixels,'LDA - Train')
+g4 <- get_pr_curve(lda_model,total_holdout,'LDA - Test')
+g5 <- get_pr_curve(qda_model,haiti_pixels,'QDA - Train')
+g6 <- get_pr_curve(qda_model,total_holdout,'QDA - Test')
+
+{g1 + g3 + g5+ plot_layout(ncol = 3,widths = c(2,2,2))} / 
+  {g2 + g4 + g6 + plot_layout(ncol = 3,widths = c(2,2,2))}
+```
+
+Figures 16 and 17 show a comparison of precision-recall curves on both the train and test data. In both instances, the logistic regression model performed the best for this metric. 
+```{r RPR-curves-overlaid-train}
+#| fig.cap: Figure 16. Precision-Recall Curve Comparison on Train Data
+#| out.width: 75%
+#| fig.width: 5
+#| fig.height: 5
+#| warning: FALSE
+#| message: FALSE
+pr_t <- bind_rows(
+  logreg_model %>% augment(haiti_pixels) %>%
+    mutate(model="Logistic regression"),
+  lda_model %>% augment(haiti_pixels) %>%
+    mutate(model="LDA"),
+  qda_model %>% augment(haiti_pixels) %>%
+    mutate(model="QDA")
+) %>%
+  group_by(model) %>%
+  pr_curve(truth=Class, .pred_Blue_Tarp, event_level="first") %>% 
+  autoplot() 
+
+pr_t
+```
+
+```{r RPR-curves-overlaid-test}
+#| fig.cap: Figure 17. Precision-Recall Curve Comparison on Test Data
+#| out.width: 75%
+#| fig.width: 5
+#| fig.height: 5
+#| warning: FALSE
+#| message: FALSE
+pr_h <- bind_rows(
+  logreg_model %>% augment(total_holdout) %>%
+    mutate(model="Logistic regression"),
+  lda_model %>% augment(total_holdout) %>%
+    mutate(model="LDA"),
+  qda_model %>% augment(total_holdout) %>%
+    mutate(model="QDA")
+) %>%
+  group_by(model) %>%
+  pr_curve(truth=Class, .pred_Blue_Tarp, event_level="first") %>% 
+  autoplot() 
+
+pr_h
+```
+
+We also performed an analysis on the model metrics to see how the metrics from the test datasets performed on each model with and without threshold selection. The LDA and QDA models generally performed better on test data with the selected threshold. The logistic regression model performed worse on test data with the selected threshold.
+
+The logistic regression model with threshold selection performed worse when comparing the accuracy and F-measure. The logistic regression model with selection outperformed the model without selection when considering the false positive rate. The model with threshold selection negligibly outperformed based on the true positive rate and had the same ROC AUC. 
+
+The LDA model with threshold selection performed better when comparing the accuracy. The model negligibly outperformed based on the F-measure. The model performed worse based on the true positive rate as well as false positive rate and had the same ROC AUC. 
+
+The QDA model with threshold selection performed better when comparing the true positive rate and marginally better when comparing false positive rate. The model negligibly performed worse based on accuracy and F-measure. The model with and without threshold selection had the same ROC AUC. 
+
+
+``` {r metric-comparison-threshold}
+#| warning: FALSE
+#| message: FALSE
+#| fig.cap: Figure 18. Metrics of the Classification Models With and Without Threshold Selection
+#| fig.width: 10
+#| fig.height: 5
+#| out.width: 100%
+all_metrics_no_thres <- all_metrics %>% 
+  arrange(dataset) %>% 
+  filter(dataset == "Test")%>% 
+  filter(model == "Logistic Regression" | model == "LDA" | model == "QDA")%>%
+  pivot_wider(names_from = .metric,values_from = .estimate) %>%
+  mutate(spec, FPR = 1-spec) %>%
+  select('model','roc_auc','accuracy','sens','FPR','f_meas')
+all_metrics_no_thres$Threshold <- c("No Threshold","No Threshold","No Threshold")
+colnames(all_metrics_no_thres) <- c('model','ROC'
+                                    ,'Accuracy','TPR (Sensitivity) '
+                                    ,'FPR (1 - Specificity)','F-meas','Threshold')
+
+all_metrics_threshold <- every_metric %>% 
+  filter(dataset == "Test") %>%
+  select('model','ROC','Accuracy','TPR','FPR','F_meas','Threshold')
+all_metrics_threshold$Threshold <- c("With Threshold","With Threshold","With Threshold")
+colnames(all_metrics_threshold) <- c('model','ROC'
+                                    ,'Accuracy'
+                                    ,'TPR (Sensitivity) '
+                                    ,'FPR (1 - Specificity)','F-meas','Threshold')
+
+all_metrics_threshold <- rbind(all_metrics_threshold,all_metrics_no_thres) %>%
+  arrange(model) %>% 
+  pivot_longer(cols = c('ROC','Accuracy','TPR (Sensitivity) '
+                                    ,'FPR (1 - Specificity)','F-meas') 
+               ,names_to = "metric", values_to = "value")
+
+ggplot(all_metrics_threshold, aes(x=value, y=model, color=Threshold)) +
+    geom_point() +
+    facet_wrap(~ metric, scale="free_x") +
+    xlab("Metric Estimate") + ylab("Model") + labs(color = "Dataset")
+```
+
+
+### V. Conclusion
+
+After fitting several models, predicting probabilities on test data, and analyzing the ROC curves, we identified optimal thresholds that maximized the F-measure, addressing both sensitivity and specificity. This approach ensures that our model's predictions align well with identifying displaced individuals and minimizing the number of blue tarp pixels that were not identified, enhancing the model's utility to identify displaced persons. 
+
+The QDA model with threshold selection performed the best with regard to the F-measure, accuracy, and lower false positive rate when fit on the training and test data split. The F-measure value for this model was 0.684. This means that the model is effectively minimizing false positives and false negatives, performing well and identifying blue-tarp areas where displaced individuals are located. It also means that fewer resources will be expended to further investigate areas incorrectly classified with a blue tarp by the QDA model. The low FPR values instill a fair amount of confidence in the model's classification results. Although the model performed the best on the training and test split data, the F-measure value on the test set is only moderately high on a scale from 0 to 1, indicating that the model was only moderately better than guessing. This means that further actions to improve the performance of the model, including the tuning of hyperparameters, would be recommended if there were a limited number of resources available to rescue displaced people. 
+ 
+Compared to the QDA model with threshold selection, the LDA model with threshold selection performed equally well when considering the ROC AUC; both models had an ROC AUC of 0.992. The LDA model had a TPR of 0.755 on the test data, which is slightly lower than the QDA model’s TPR of 0.761. The LDA model’s F-Measure value of 0.401 was lower than the QDA model but still indicates more value than the logistic regression F-measure value of 0.288. Since the metrics for the LDA model are equal to or slightly inferior to the QDA model, the LDA model could be used as a secondary reference for identifying or predicting where displaced individuals are located. 
+ 
+Overall, the logistic regression model performed fairly well when fit with 10-fold cross-validation data, but less well when fit with the training and test split data. For the model fit on the test and training data split, several performance metrics on the test data performed worse than the QDA and LDA models, with lower accuracy, FPR, precision, and F-measure values. However, the model still had a high ROC AUC value of 0.999, a high PRC AUC value of 0.969, and a high TPR of 0.993. This is likely due in part to the fact that the dataset was imbalanced and the ROC AUC metric. This meant the models fit on the imbalanced data are less sensitive to the performance of the minority class, blue tarp pixels, because it gives equal weight to both positive and negative classes, regardless of imbalanced distributions. However, the logistic regression model performed well when fit with the cross validation data. It had the highest F-measure value (0.911) for the models fit with cross-validation and a sensitivity value (TPR) of 0.912. This means that the logistic model also has potential utility when attempting to identify displaced persons. In particular, it might be useful in situations where the TPR should be maximized and the FPR does not necessarily need to be minimized because there are abundant resources available to search all locations classified with blue tarps, even if those locations were incorrectly classified.
+ 
+The use of the QDA model to identify displaced people would be somewhat effective to save human life. In this case, a regression model is an efficient and fast option for the extremely large test data set, and the F-measure value of 0.684 and precision value of 0.621 on the test set indicates that the model would accurately identify blue tarp areas, while minimizing the false positives. The QDA model also enables us to account for non-linear boundaries. The approach of this model would also save rescue resources from investigating areas misclassified as a location of a blue tarp that did not actually have any displaced people. An alternative logistic regression model fit on the cross-validation data will also have utility, particularly if resources are not limited to search all areas classified as blue tarp pixels, even if there are false positives. However, it is possible that a non-linear classifier, such as K-Nearest Neighbors, could potentially also be effective if the relationship between the red, green, and blue pixels is (1) complex due to the variations in color hue based on time of day, the geographic area, and vegetation and (2) pixels tend to be clustered together.
+
+
+```{r stop-cluster}
+#| warning: FALSE
+#| message: FALSE
+stopCluster(cl)
+registerDoSEQ()
+```
+
+
+

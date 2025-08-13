@@ -1,0 +1,2098 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE)
+knitr::opts_chunk$set(cache=TRUE, autodep=TRUE)
+knitr::opts_chunk$set(fig.align="center", fig.pos="tbh")
+```
+
+```{r packages}
+#| warning: FALSE
+#| message: FALSE
+library(tidyverse)
+library(tidymodels)
+library(discrim) # for LDA and QDA
+library(ggcorrplot)  # for correlation plot
+library(GGally)  # scatterplot matrix
+library(patchwork)  # for combining plots
+library(probably)  # for threshold_perf
+library(pROC)
+library(data.table)
+library(patchwork)
+library(caret)
+library(vip)
+library(xgboost)
+```
+
+```{r setup-parallel}
+#| cache: FALSE
+#| message: false
+#| warning: FALSE
+
+#Set up parallel processing
+library(doParallel)
+cl <- makePSOCKcluster(parallel::detectCores(logical = FALSE))
+registerDoParallel(cl)
+```
+
+```{r load training data, include = FALSE}
+#| warning: FALSE
+#| message: FALSE
+##Load training data
+haiti = read.csv("HaitiPixels.csv")
+
+haiti_pixels_full = copy(haiti)
+
+#Transform data to factors
+haiti <- haiti %>% 
+  mutate(Class = ifelse(Class == 'Blue Tarp','Blue_Tarp','Non_Tarp')) %>% 
+  mutate(Class = as.factor(Class)) %>% 
+  select('Red','Green','Blue','Class')
+```
+
+
+```{r load holdout data, include = FALSE}
+#| warning: FALSE
+#| message: FALSE
+# Load holdout data
+read_holdout_data <- function(filepath){
+  fread(filepath, header = FALSE, select = c(2:10), col.names = c('X', 'Y', 'Map X', 'Map Y', 'Lat', 'Lon', 'Red', 'Green', 'Blue'))
+}
+
+nb57 = read_holdout_data("HoldOutData/orthovnir057_ROI_NON_Blue_Tarps.txt")
+b67 = read_holdout_data("HoldOutData/orthovnir067_ROI_Blue_Tarps.txt")
+nb67 = read_holdout_data("HoldOutData/orthovnir067_ROI_NOT_Blue_Tarps.txt")
+b69 = read_holdout_data("HoldOutData/orthovnir069_ROI_Blue_Tarps.txt")
+nb69 = read_holdout_data("HoldOutData/orthovnir069_ROI_NOT_Blue_Tarps.txt")
+b78 = read_holdout_data("HoldOutData/orthovnir078_ROI_Blue_Tarps.txt")
+nb78 = read_holdout_data("HoldOutData/orthovnir078_ROI_NON_Blue_Tarps.txt")
+
+# Transform holdout data
+blue_df <- rbind(b67, b69, b78) %>% 
+  mutate(Class = 'Blue_Tarp')
+nonblue_df <- rbind(nb57, nb67, nb69, nb78) %>% 
+  mutate(Class = 'Non_Tarp')
+total_holdout <- rbind(blue_df, nonblue_df)
+total_holdout <- total_holdout %>% 
+  mutate(Class = as.factor(Class)) %>% 
+  select('Red','Green','Blue','Class')
+```
+
+<center> <h1>Disaster Relief Project, Part 2</h1> </center>
+<center> <h5>Group 13: Sarah Christen, Katherine Kelleher, Margaret Lindsay, and Brian Nolton</h5> </center>
+
+
+### II. Data
+
+```{r boxplot-filter-data}
+#| warning: FALSE
+#| message: FALSE
+hblue_df <- haiti %>% 
+  filter(Class == "Blue_Tarp")
+hnonblue_df <- haiti %>% 
+  filter(Class == "Non_Tarp")
+```
+
+```{r boxplot-bluetarp}
+#| fig.cap: Figure 1. Boxplots of Red, Green, Blue Variables in Training and Holdout Datasets For Tarp and Non-Tarp Pixels
+#| out.width: 95%
+#| fig.width: 10
+#| fig.height: 4
+#| warning: FALSE
+#| message: FALSE
+tarp <- ggplot() +
+  geom_boxplot(data = hblue_df, aes(x = factor("T Red"), y = Red, fill = "Training Data")) +
+  geom_boxplot(data = hblue_df, aes(x = factor("T Green"),  y = Green, fill = "Training Data")) +  
+  geom_boxplot(data = hblue_df, aes(x = factor("T Blue"), y = Blue, fill = "Training Data")) +  
+  geom_boxplot(data = blue_df, aes(x = factor("H Red"), y = Red, fill = "Holdout Data")) +
+  geom_boxplot(data = blue_df, aes(x = factor("H Green"), y = Green, fill = "Holdout Data")) +
+  geom_boxplot(data = blue_df, aes(x = factor("H Blue"), y = Blue, fill = "Holdout Data")) +
+  theme_minimal() +
+  labs(title = "Comparison of Colors for the Tarps",
+       x = "Color",
+       y = "Value", 
+       fill = "Source")
+
+nontarp <- ggplot() +
+  geom_boxplot(data = hnonblue_df, aes(x = factor("T Red"), y = Red, fill = "Training Data")) +
+  geom_boxplot(data = hnonblue_df, aes(x = factor("T Green"), y = Green, fill = "Training Data")) +
+  geom_boxplot(data = hnonblue_df, aes(x = factor("T Blue"), y = Blue, fill = "Training Data")) +  
+  geom_boxplot(data = nonblue_df, aes(x = factor("H Red"), y = Red, fill = "Holdout Data")) +
+  geom_boxplot(data = nonblue_df, aes(x = factor("H Green"), y = Green, fill = "Holdout Data")) +
+  geom_boxplot(data = nonblue_df, aes(x = factor("H Blue"), y = Blue, fill = "Holdout Data")) +
+  theme_minimal() +
+  labs(title = "Comparison of Colors for the Nontarps",
+       x = "Color",
+       y = "Value",
+       fill = "Source")
+
+tarp + nontarp
+```
+
+```{r boxplots-training-data}
+#| fig.cap: Figure 2. Boxplots of Categorical Variables for Training Data
+#| out.width: 65%
+#| fig.width: 6
+#| fig.height: 4
+#| warning: FALSE
+#| message: FALSE
+
+bp1 = ggplot(haiti, aes(x = Class, y=Red))+
+  geom_boxplot() +  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+
+bp2 = ggplot(haiti, aes(x = Class, y=Blue))+
+  geom_boxplot() + theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+
+bp3 = ggplot(haiti, aes(x = Class, y=Green))+
+  geom_boxplot() +  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+
+bp1 +  bp3 + bp2
+
+```
+
+
+```{r boxplots-holdout-data}
+#| fig.cap: Figure 3. Boxplots of Categorical Variables for Holdout Data
+#| out.width: 65%
+#| fig.width: 6
+#| fig.height: 4
+#| warning: FALSE
+#| message: FALSE
+
+
+bp4 = ggplot(total_holdout, aes(x = Class, y=Red))+
+  geom_boxplot() +  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + ylab("B1")
+
+bp5 = ggplot(total_holdout, aes(x = Class, y=Blue))+
+  geom_boxplot() + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + ylab("B3")
+
+bp6 = ggplot(total_holdout, aes(x = Class, y=Green))+
+  geom_boxplot() +  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + ylab("B2")
+
+bp4 +  bp6 + bp5
+
+```
+
+
+
+```{r bar-chart-class}
+# Training
+avg_rgb <- haiti_pixels_full %>% 
+  group_by(Class) %>% 
+  summarize(avg_r = mean(Red), avg_g = mean(Green) , avg_b = mean(Blue))
+
+class_colors <- c(rgb(avg_rgb$avg_r[1], avg_rgb$avg_g[1], avg_rgb$avg_b[1], maxColorValue = 255),
+                 rgb(avg_rgb$avg_r[2], avg_rgb$avg_g[2], avg_rgb$avg_b[2], maxColorValue = 255),
+                 rgb(avg_rgb$avg_r[3], avg_rgb$avg_g[3], avg_rgb$avg_b[3], maxColorValue = 255),
+                 rgb(avg_rgb$avg_r[4], avg_rgb$avg_g[4], avg_rgb$avg_b[4], maxColorValue = 255),
+                 rgb(avg_rgb$avg_r[5], avg_rgb$avg_g[5], avg_rgb$avg_b[5], maxColorValue = 255))
+
+ggplot(haiti_pixels_full, aes(x=Class))+
+  geom_bar(fill=class_colors)+
+  scale_y_continuous(labels = scales::comma)+
+  theme(plot.title = element_text(hjust = 0.5))+
+  labs(title = 'Training Data Class Histogram')
+```
+
+
+```{r blue-green-scatter}
+ggplot(haiti_pixels_full, aes(x=Blue, y=Green, color=Class))+
+  geom_point(alpha=0.7)+
+  labs(x="Blue", y="Green") +
+  scale_color_manual(values=class_colors)+
+  theme(plot.title = element_text(hjust = 0.5))+
+  labs(title = 'Training Data Green Against Blue')
+```
+
+```{r blue-red-scatter}
+ggplot(haiti_pixels_full, aes(x=Blue, y=Red, color=Class))+
+  geom_point(alpha=0.7)+
+  labs(x="Blue", y="Red") +
+  scale_color_manual(values=class_colors)+
+  theme(plot.title = element_text(hjust = 0.5))+
+  labs(title = 'Training Data Red Against Blue')
+```
+
+```{r green-red-scatter}
+ggplot(haiti_pixels_full, aes(x=Green, y=Red, color=Class))+
+  geom_point(alpha=0.7)+
+  labs(x="Green", y="Red") +
+  scale_color_manual(values=class_colors)+
+  theme(plot.title = element_text(hjust = 0.5))+
+  labs(title = 'Training Data Red Against Green')
+
+```
+
+```{r bar-chart-class-holdout}
+# Holdout
+avg_rgb_ho <- total_holdout %>% 
+  group_by(Class) %>% 
+  summarize(avg_r = mean(Red), avg_g = mean(Green) , avg_b = mean(Blue))
+
+class_colors_ho <- c(rgb(avg_rgb$avg_r[1], avg_rgb$avg_g[1], avg_rgb$avg_b[1], maxColorValue = 255),
+                 rgb(avg_rgb$avg_r[2], avg_rgb$avg_g[2], avg_rgb$avg_b[2], maxColorValue = 255))
+
+ggplot(total_holdout, aes(x=Class)) +
+  geom_bar(fill=class_colors_ho) +
+  scale_y_continuous(labels = scales::comma)+
+  theme(plot.title = element_text(hjust = 0.5)) +
+  labs(title = 'Holdout Data Class Histogram')
+```
+
+```{r distribution plots}
+#| fig.cap: Figure 4. Plots of Class Variable Distribution of Training and Holdout Datasets
+#| out.width: 85%
+#| fig.width: 6
+#| fig.height: 4
+#| warning: FALSE
+#| message: FALSE
+
+colors <- c("#A9BACD", "#C3B7A2")
+
+g1 = ggplot(haiti, aes(x = Class))+
+  geom_histogram(stat = 'count',fill = colors) +  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  ylab("Count") + ggtitle("Training Dataset")
+
+g2 = ggplot(total_holdout, aes(x = Class))+
+  geom_histogram(stat = 'count',fill = colors) + theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  ylab("Count") + ggtitle("Holdout Dataset")
+
+g1 + g2
+```
+
+```{r blue-green-scatter-ho}
+ggplot(total_holdout, aes(x=Blue, y=Green, color=Class))+
+  geom_point(alpha=0.7)+
+  labs(x="Blue", y="Green") +
+  scale_color_manual(values=class_colors_ho)+
+  theme(plot.title = element_text(hjust = 0.5))+
+  labs(title = 'Holdout Data Green Against Blue')
+```
+
+```{r blue-green-scatter-ho}
+ggplot(total_holdout, aes(x=Blue, y=Red, color=Class))+
+  geom_point(alpha=0.7)+
+  labs(x="Blue", y="Red") +
+  scale_color_manual(values=class_colors_ho)+
+  theme(plot.title = element_text(hjust = 0.5))+
+  labs(title = 'Holdout Data Red Against Blue')
+```
+
+```{r blue-green-scatter-ho}
+ggplot(total_holdout, aes(x=Green, y=Red, color=Class))+
+  geom_point(alpha=0.7)+
+  labs(x="Green", y="Red") +
+  scale_color_manual(values=class_colors_ho)+
+  theme(plot.title = element_text(hjust = 0.5))+
+  labs(title = 'Holdout Data Red Against Green')
+```
+
+### IV. Results
+
+```{r model fit no threshold, include = FALSE}
+#| warning: FALSE
+#| message: FALSE
+set.seed(1)
+formula <- `Class` ~ . 
+cv_metrics <- metric_set(roc_auc, accuracy, f_meas)
+
+#Approach to fit models WITHOUT cross validation
+reference_model <- null_model(mode="classification") %>%
+    set_engine("parsnip") %>%
+    fit(formula, haiti)
+
+logreg_model <- logistic_reg(mode="classification", engine="glm") %>%
+    fit(formula, haiti)
+
+lda_model <- discrim_linear(mode="classification", engine="MASS") %>%
+    fit(formula, haiti)
+
+qda_model <- discrim_quad(mode="classification", engine="MASS") %>%
+    fit(formula, haiti)
+
+predictions_ref <- reference_model %>% augment(total_holdout)
+predictions_log <- logreg_model %>% augment(total_holdout)
+predictions_lda <- lda_model %>% augment(total_holdout)
+predictions_qda <- qda_model %>% augment(total_holdout)
+```
+
+
+```{r cross-validation, include = FALSE}
+#| warning: FALSE
+#| message: FALSE
+#Approach to fit models WITH cross validation
+
+#Recipe
+recipe <- recipe(formula, data=haiti) %>%
+  step_normalize(all_numeric_predictors())
+
+#Models
+logreg_spec <- logistic_reg(mode="classification", engine="glm")
+lda_spec <- discrim_linear(mode="classification", engine="MASS")
+qda_spec <- discrim_quad(mode="classification", engine="MASS")
+
+#Workflow
+logreg_wf <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(logreg_spec)
+
+lda_wf <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(lda_spec)
+
+qda_wf <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(qda_spec)
+
+#Cross validation approach
+resamples <- vfold_cv(haiti, v=10, strata=Class)
+custom_metrics <- metric_set(accuracy, f_meas, accuracy, sens, spec)
+cv_control <- control_resamples(save_pred=TRUE)
+cv_metrics1 <- metric_set(roc_auc, accuracy)
+custom_metrics2 <- yardstick::metric_set(f_meas, accuracy, kap,roc_auc)
+
+#Cross Validation
+logreg_cv <- fit_resamples(logreg_wf, resamples, metrics=cv_metrics, control=cv_control)
+lda_cv <- lda_cv <- fit_resamples(lda_wf, resamples, metrics=cv_metrics, control=cv_control)
+qda_cv <- qda_cv <- fit_resamples(qda_wf, resamples, metrics=cv_metrics, control=cv_control)
+```
+
+```{r cv-predictions}
+cv_predictions_logreg <- collect_predictions(logreg_cv)
+cv_predictions_lda <- collect_predictions(lda_cv)
+cv_predictions_qda <- collect_predictions(qda_cv)
+```
+
+```{r cv-threshold}
+#| warning: FALSE
+#| message: FALSE
+ #Define function to identify threshold for CV models
+ threshold_cv <- function(model_predictions_cv) {
+     performance <- model_predictions_cv %>% 
+       probably::threshold_perf(Class, .pred_Blue_Tarp,
+         thresholds=seq(0.05, 0.95, 0.05), event_level="first",
+         metrics=metric_set(f_meas))
+     max_metrics <- performance %>%
+         drop_na() %>%
+         group_by(.metric) %>%
+         filter(.estimate == max(.estimate))
+     threshold <- max_metrics %>%
+         select(.metric, .threshold) %>%
+         deframe()
+     return(threshold=threshold)
+ }
+ 
+ # Use function to define threshold for CV models
+ logreg_cv_threshold <- threshold_cv(cv_predictions_logreg)
+ lda_cv_threshold <- threshold_cv(cv_predictions_lda)
+ qda_cv_threshold <- threshold_cv(cv_predictions_qda)
+ 
+ logreg_cv_predict_threshold <- cv_predictions_logreg %>%
+     mutate(.pred_class = factor(ifelse(.pred_Blue_Tarp >= logreg_cv_threshold, "Blue_Tarp", "Non_Tarp")))
+ lda_cv_predict_threshold <- cv_predictions_lda %>%
+     mutate(.pred_class = factor(ifelse(.pred_Blue_Tarp >= lda_cv_threshold, "Blue_Tarp", "Non_Tarp")))
+ qda_cv_predict_threshold <- cv_predictions_qda%>%
+     mutate(.pred_class = factor(ifelse(.pred_Blue_Tarp >= qda_cv_threshold, "Blue_Tarp", "Non_Tarp")))
+```
+
+
+```{r threshold-scan}
+#| fig.cap: Figure 13. Threshold Scan of Each Classification Model using the F-Measure
+#| out.width: 90%
+#| fig.width: 10
+#| fig.height: 4
+#| warning: FALSE
+#| message: FALSE
+threshold_scan <- function(model, data, model_name) {
+    threshold_data <- model %>%
+        augment(data) %>%
+        probably::threshold_perf(Class, .pred_Blue_Tarp,
+            thresholds=seq(0.05, 0.95, 0.01), event_level="first",
+            metrics=metric_set(f_meas))
+    opt_threshold <- threshold_data %>%
+        arrange(-.estimate) %>%
+        first()
+    g <- ggplot(threshold_data, aes(x=.threshold, y=.estimate)) +
+        geom_line() +
+        geom_point(data=opt_threshold, color="red", size=2) +
+        labs(title=model_name, x="Threshold", y="F Measure") +
+        coord_cartesian(ylim=c(0.2, 1))
+    return(list(
+        graph=g,
+        threshold=opt_threshold %>%
+            pull(.threshold)
+    ))
+}
+
+g1 <- threshold_scan(logreg_model, haiti, "Logistic Regression")
+g2 <- threshold_scan(lda_model, haiti, "LDA")
+g3 <- threshold_scan(qda_model, haiti, "QDA")
+
+logreg_threshold <- g1$threshold
+lda_threshold <- g2$threshold
+qda_threshold <- g3$threshold
+
+g1$graph + g2$graph + g3$graph + plot_layout(ncol = 3,widths = c(3,3,3))
+```
+
+
+```{r model-metrics-threshold}
+#| warning: FALSE
+#| message: FALSE
+predict_at_threshold <- function(model, data, threshold) {
+    return(
+        model %>%
+            augment(data) %>%
+            mutate(.pred_class = factor(make_two_class_pred(.pred_Blue_Tarp,
+                    c("Blue_Tarp", "Non_Tarp"), threshold=threshold), levels = c("Blue_Tarp","Non_Tarp"))
+            )
+    )
+}
+custom_metrics2_7 <- yardstick::metric_set(accuracy,f_meas, sens)
+
+calculate_metrics_at_threshold <- function(model, train, holdout, model_name, threshold) {
+    bind_rows(
+        # Accuracy of training set
+        bind_cols(
+            model=model_name, dataset="train", threshold=threshold,
+            custom_metrics2_7(predict_at_threshold(model, train, threshold), truth=Class, estimate=.pred_class),
+        ),
+        # AUC of ROC curve of training set
+        bind_cols(
+            model=model_name, dataset="train", threshold=threshold,
+            roc_auc(model %>% augment(haiti), Class, .pred_Blue_Tarp, event_level="first"),
+        ),
+        # Accuracy of holdout set
+        bind_cols(
+            model=model_name, dataset="holdout", threshold=threshold,
+            custom_metrics2_7(predict_at_threshold(model, holdout, threshold), truth=Class, estimate=.pred_class),
+        ),
+        # AUC of ROC curve of holdout set
+        bind_cols(
+            model=model_name, dataset="holdout", threshold=threshold,
+            roc_auc(model %>% augment(total_holdout), Class, .pred_Blue_Tarp, event_level="first"),
+        ),
+    )
+}
+
+metrics_table <- function(all_metrics, caption) {
+    all_metrics %>%
+        pivot_wider(names_from=.metric, values_from=.estimate) %>%
+        select(-.estimator) %>%
+        knitr::kable(caption=caption, digits=3) %>%
+        kableExtra::kable_styling(full_width=FALSE)
+}
+
+logreg_train_predict <- predict_at_threshold(logreg_model, haiti, logreg_threshold)
+logreg_test_predict <- predict_at_threshold(logreg_model, total_holdout, logreg_threshold)
+lda_train_predict <- predict_at_threshold(lda_model, haiti, lda_threshold)
+lda_test_predict <- predict_at_threshold(lda_model, total_holdout, lda_threshold)
+qda_train_predict <- predict_at_threshold(qda_model, haiti, qda_threshold)
+qda_test_predict <- predict_at_threshold(qda_model, total_holdout, qda_threshold)
+
+calculate_roc_at_threshold <- function(model, data, threshold) {
+    bind_rows(
+        # AUC of ROC curve of training set
+        bind_cols(
+            threshold=threshold,
+            roc_auc(model %>% augment(data), Class, .pred_Blue_Tarp, event_level="first"),
+        ),
+    )
+}
+
+lrm_train_roc <- calculate_roc_at_threshold(logreg_model, haiti, logreg_threshold)
+lda_train_roc <- calculate_roc_at_threshold(lda_model, haiti, lda_threshold)
+qda_train_roc <- calculate_roc_at_threshold(qda_model, haiti, qda_threshold)
+lrm_test_roc <- calculate_roc_at_threshold(logreg_model, total_holdout, logreg_threshold)
+lda_test_roc <- calculate_roc_at_threshold(lda_model, total_holdout, lda_threshold)
+qda_test_roc <- calculate_roc_at_threshold(qda_model, total_holdout, qda_threshold)
+
+lrm_train_cm <- confusionMatrix(data = logreg_train_predict$.pred_class, reference = haiti$Class)
+lrm_train_accuracy <- lrm_train_cm$overall["Accuracy"]
+lrm_train_tpr <- lrm_train_cm$byClass["Sensitivity"]
+lrm_train_fpr <- 1 - lrm_train_cm$byClass["Specificity"]
+lrm_train_precision <- lrm_train_cm$byClass["Precision"]
+lrm_train_f1_score <- lrm_train_cm$byClass["F1"]
+
+lrm_test_cm <- confusionMatrix(data = logreg_test_predict$.pred_class, reference = total_holdout$Class)
+lrm_test_accuracy <- lrm_test_cm$overall["Accuracy"]
+lrm_test_tpr <- lrm_test_cm$byClass["Sensitivity"]
+lrm_test_fpr <- 1 - lrm_test_cm$byClass["Specificity"]
+lrm_test_precision <- lrm_test_cm$byClass["Precision"]
+lrm_test_f1_score <- lrm_test_cm$byClass["F1"]
+
+lda_train_cm <- confusionMatrix(data = lda_train_predict$.pred_class, reference = haiti$Class)
+lda_train_accuracy <- lda_train_cm$overall["Accuracy"]
+lda_train_tpr <- lda_train_cm$byClass["Sensitivity"]
+lda_train_fpr <- 1 - lda_train_cm$byClass["Specificity"]
+lda_train_precision <- lda_train_cm$byClass["Precision"]
+lda_train_f1_score <- lda_train_cm$byClass["F1"]
+
+lda_test_cm <- confusionMatrix(data = lda_test_predict$.pred_class, reference = total_holdout$Class)
+lda_test_accuracy <- lda_test_cm$overall["Accuracy"]
+lda_test_tpr <- lda_test_cm$byClass["Sensitivity"]
+lda_test_fpr <- 1 - lda_test_cm$byClass["Specificity"]
+lda_test_precision <- lda_test_cm$byClass["Precision"]
+lda_test_f1_score <- lda_test_cm$byClass["F1"]
+
+qda_train_cm <- confusionMatrix(data = qda_train_predict$.pred_class, reference = haiti$Class)
+qda_train_accuracy <- qda_train_cm$overall["Accuracy"]
+qda_train_tpr <- qda_train_cm$byClass["Sensitivity"]
+qda_train_fpr <- 1 - qda_train_cm$byClass["Specificity"]
+qda_train_precision <- qda_train_cm$byClass["Precision"]
+qda_train_f1_score <- qda_train_cm$byClass["F1"]
+
+qda_test_cm <- confusionMatrix(data = qda_test_predict$.pred_class, reference = total_holdout$Class)
+qda_test_accuracy <- qda_test_cm$overall["Accuracy"]
+qda_test_tpr <- qda_test_cm$byClass["Sensitivity"]
+qda_test_fpr <- 1 - qda_test_cm$byClass["Specificity"]
+qda_test_precision <- qda_test_cm$byClass["Precision"]
+qda_test_f1_score <- qda_test_cm$byClass["F1"]
+
+every_metric <- bind_rows(
+    bind_cols(
+    model="Logistic Regression",
+    dataset="Test",
+    ROC = lrm_test_roc$.estimate,
+    Threshold = logreg_threshold,
+    Accuracy = lrm_test_accuracy,
+    TPR = lrm_test_tpr,
+    FPR  = lrm_test_fpr,
+    Precision = lrm_test_precision,
+    F_meas = lrm_test_f1_score
+      ),
+  bind_cols(
+    model="LDA",
+    dataset="Test",
+    ROC = lda_test_roc$.estimate,
+    Threshold = lda_threshold,
+    Accuracy = lda_test_accuracy,
+    TPR = lda_test_tpr,
+    FPR  = lda_test_fpr,
+    Precision = lda_test_precision,
+    F_meas = lda_test_f1_score
+      ),    
+  bind_cols(
+    model="QDA",
+    dataset="Test",
+    ROC = qda_test_roc$.estimate,
+    Threshold = qda_threshold,
+    Accuracy = qda_test_accuracy,
+    TPR = qda_test_tpr,
+    FPR = qda_test_fpr,
+    Precision = qda_test_precision,
+    F_meas = qda_test_f1_score
+      ),    
+  bind_cols(
+    model="Logistic Regression",
+    dataset="Train",
+    ROC = lrm_train_roc$.estimate,
+    Threshold = logreg_threshold,
+    Accuracy = lrm_train_accuracy,
+    TPR = lrm_train_tpr,
+    FPR  = lrm_train_fpr,
+    Precision = lrm_train_precision,
+    F_meas = lrm_train_f1_score
+      ),
+  bind_cols(
+    model="LDA",
+    dataset="Train",
+    ROC = lda_train_roc$.estimate,
+    Threshold = lda_threshold,
+    Accuracy = lda_train_accuracy,
+    TPR = lda_train_tpr,
+    FPR  = lda_train_fpr,
+    Precision = lda_train_precision,
+    F_meas = lda_train_f1_score
+      ),
+  bind_cols(
+    model="QDA",
+    dataset="Train",
+    ROC = qda_train_roc$.estimate,
+    Threshold = qda_threshold,
+    Accuracy = qda_train_accuracy,
+    TPR = qda_train_tpr,
+    FPR  = qda_train_fpr,
+    Precision = qda_train_precision,
+    F_meas = qda_train_f1_score
+      )
+)
+```
+
+
+```{r confusion-matrix}
+#| fig.cap: Figure 14. Confusion Matrix for Each Model On Holdout Data
+#| out.width: 95%
+#| fig.width: 12
+#| fig.height: 6
+#| warning: FALSE
+#| message: FALSE
+# Preductions for holdout
+predictions2 <- logreg_model %>% augment(haiti)
+predictions3 <- lda_model %>% augment(haiti)
+predictions4 <- qda_model %>% augment(haiti)
+
+#Confusion Matrix of Test Data
+cm2logreg_test <- predictions2 %>%
+    conf_mat(truth=Class, estimate=.pred_class)
+cm3lda_test <- predictions3 %>%
+    conf_mat(truth=Class, estimate=.pred_class)
+cm4qda_test <- predictions4 %>%
+    conf_mat(truth=Class, estimate=.pred_class)
+
+#Confusion Matrix of Threshold Test Data
+logreg_test_thres_cm <- logreg_test_predict %>% conf_mat(truth=Class, estimate=.pred_class)
+lda_test_thres_cm <- lda_test_predict%>% conf_mat(truth=Class, estimate=.pred_class)
+qda_test_thres_cm <- qda_test_predict%>% conf_mat(truth=Class, estimate=.pred_class)
+
+logreg_precision_test <- cm2logreg_test$table[1]/(cm2logreg_test$table[1]+cm2logreg_test$table[3])
+logreg_fnr_test <- cm2logreg_test$table[2]/(cm2logreg_test$table[1]+cm2logreg_test$table[2])
+lda_precision_test <- cm3lda_test$table[1]/(cm3lda_test$table[1]+cm3lda_test$table[3])
+lda_fnr_test <- cm3lda_test$table[2]/(cm3lda_test$table[1]+cm3lda_test$table[2])
+qda_precision_test <- cm4qda_test$table[1]/(cm4qda_test$table[1]+cm4qda_test$table[3])
+qda_fnr_test <- cm4qda_test$table[2]/(cm4qda_test$table[1]+cm4qda_test$table[2])
+
+Truth <- factor(c('Blue_Tarp', 'Blue_Tarp', 'Non_Tarp', 'Non_Tarp'))
+Prediction <- factor(c('Blue_Tarp', 'Non_Tarp', 'Blue_Tarp', 'Non_Tarp'))
+Ylog <- cm2logreg_test$table
+Ylda <- cm3lda_test$table
+Yqda <- cm4qda_test$table
+dflog <- data.frame(Truth, Prediction, Ylog)
+dflda <- data.frame(Truth, Prediction, Ylda)
+dfqda <- data.frame(Truth, Prediction, Yqda)
+Ylogthres <- logreg_test_thres_cm$table
+Yldathres <- lda_test_thres_cm$table
+Yqdathres <- qda_test_thres_cm$table
+dflogthres <- data.frame(Truth, Prediction, Ylogthres)
+dfldathres <- data.frame(Truth, Prediction, Yldathres)
+dfqdathres <- data.frame(Truth, Prediction, Yqdathres)
+
+cmlog <- ggplot(data =  dflog, mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(aes(fill = Freq), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+  scale_fill_gradient(low = "grey", high = "lightblue") +
+  theme_bw() + theme(legend.position = "none") + ggtitle("Logistic Regression")
+cmlda <- ggplot(data =  dflda, mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(aes(fill = Freq), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+  scale_fill_gradient(low = "grey", high = "lightblue") +
+  theme_bw() + theme(legend.position = "none") + ggtitle("LDA")
+cmqda <- ggplot(data =  dfqda, mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(aes(fill = Freq), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+  scale_fill_gradient(low = "grey", high = "lightblue") +
+  theme_bw() + theme(legend.position = "none") + ggtitle("QDA")
+cmlogthres <- ggplot(data =  dflogthres, mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(aes(fill = Freq), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+  scale_fill_gradient(low = "grey", high = "lightblue") +
+  theme_bw() + theme(legend.position = "none") + ggtitle("Logistic Regression - Adj. Threshold")
+cmldathres <- ggplot(data =  dfldathres, mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(aes(fill = Freq), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+  scale_fill_gradient(low = "grey", high = "lightblue") +
+  theme_bw() + theme(legend.position = "none") + ggtitle("LDA - Adj. Threshold")
+cmqdathres <- ggplot(data =  dfqdathres, mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(aes(fill = Freq), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+  scale_fill_gradient(low = "grey", high = "lightblue") +
+  theme_bw() + theme(legend.position = "none") + ggtitle("QDA - Adj. Threshold")
+```
+
+
+```{r pr-metric-table}
+#| warning: FALSE
+#| message: FALSE
+pr_auc_value_log <- pr_auc(logreg_test_predict, truth=Class, .pred_Blue_Tarp, event_level="first") 
+pr_auc_value_lda <- pr_auc(lda_test_predict, truth=Class, .pred_Blue_Tarp, event_level="first") 
+pr_auc_value_qda <- pr_auc(qda_test_predict, truth=Class, .pred_Blue_Tarp, event_level="first") 
+
+pr_auc_value_log_train <- pr_auc(logreg_train_predict, truth=Class, .pred_Blue_Tarp, event_level="first") 
+pr_auc_value_lda_train <- pr_auc(lda_train_predict, truth=Class, .pred_Blue_Tarp, event_level="first") 
+pr_auc_value_qda_train <- pr_auc(qda_train_predict, truth=Class, .pred_Blue_Tarp, event_level="first")
+
+pr_auc_metric <- bind_rows(
+  bind_cols(
+    model="Logistic Regression",
+    dataset="Test",
+    PR_AUC = pr_auc_value_log$.estimate
+  ),
+  bind_cols(
+    model="LDA",
+    dataset="Test",
+    PR_AUC = pr_auc_value_lda$.estimate
+  ),    
+  bind_cols(
+    model="QDA",
+    dataset="Test",
+    PR_AUC = pr_auc_value_qda$.estimate
+  ),    
+  bind_cols(
+    model="Logistic Regression",
+    dataset="Train",
+    PR_AUC = pr_auc_value_log_train$.estimate
+  ),
+  bind_cols(
+    model="LDA",
+    dataset="Train",
+    PR_AUC = pr_auc_value_lda_train$.estimate
+  ),
+  bind_cols(
+    model="QDA",
+    dataset="Train",
+    PR_AUC = pr_auc_value_qda_train$.estimate
+  )
+)
+```
+
+
+```{r pr-curves}
+#| fig.cap: Figure 15. Precision-Recall Curve on Train and Test Data for Each Classification Model
+#| out.width: 90%
+#| fig.width: 10
+#| fig.height: 8
+#| warning: FALSE
+#| message: FALSE
+get_pr_curve <- function(model,data,model_name) {
+  pr_data <- model %>% 
+    augment(data) %>% 
+    pr_curve(truth = Class,.pred_Blue_Tarp,event_level = "first")
+  g <- autoplot(pr_data) +
+    labs(title = model_name)
+  return(g)
+}
+
+g1 <- get_pr_curve(logreg_model,haiti,'Logistic Regression - Train')
+g2 <- get_pr_curve(logreg_model,total_holdout,'Logistic Regression - Test')
+g3 <- get_pr_curve(lda_model,haiti,'LDA - Train')
+g4 <- get_pr_curve(lda_model,total_holdout,'LDA - Test')
+g5 <- get_pr_curve(qda_model,haiti,'QDA - Train')
+g6 <- get_pr_curve(qda_model,total_holdout,'QDA - Test')
+```
+
+```{r RPR-curves-overlaid-train}
+#| fig.cap: Figure 16. Precision-Recall Curve Comparison on Train Data
+#| out.width: 75%
+#| fig.width: 5
+#| fig.height: 5
+#| warning: FALSE
+#| message: FALSE
+pr_t <- bind_rows(
+  logreg_model %>% augment(haiti) %>%
+    mutate(model="Logistic regression"),
+  lda_model %>% augment(haiti) %>%
+    mutate(model="LDA"),
+  qda_model %>% augment(haiti) %>%
+    mutate(model="QDA")
+) %>%
+  group_by(model) %>%
+  pr_curve(truth=Class, .pred_Blue_Tarp, event_level="first") %>% 
+  autoplot() 
+```
+
+```{r RPR-curves-overlaid-test}
+#| fig.cap: Figure 17. Precision-Recall Curve Comparison on Test Data
+#| out.width: 75%
+#| fig.width: 5
+#| fig.height: 5
+#| warning: FALSE
+#| message: FALSE
+pr_h <- bind_rows(
+  logreg_model %>% augment(total_holdout) %>%
+    mutate(model="Logistic regression"),
+  lda_model %>% augment(total_holdout) %>%
+    mutate(model="LDA"),
+  qda_model %>% augment(total_holdout) %>%
+    mutate(model="QDA")
+) %>%
+  group_by(model) %>%
+  pr_curve(truth=Class, .pred_Blue_Tarp, event_level="first") %>% 
+  autoplot() 
+```
+
+## Part 2
+
+### Tuned Linear Model
+```{r lm tune 1}
+lm_tune_model <- logistic_reg(engine="glmnet", penalty=tune(), mixture=tune())
+
+lm_tune_wf <- workflow() %>% 
+  add_recipe(recipe) %>% 
+  add_model(lm_tune_model)
+
+lm_params <- extract_parameter_set_dials(lm_tune_wf) #%>%
+    #update(penalty = penalty(c(-1,0)))
+
+tune_lm <- tune_grid(lm_tune_wf,
+    resamples=resamples,
+    control=cv_control,
+    metrics=cv_metrics,
+    param_info=lm_params
+)
+
+autoplot(tune_lm)
+```
+
+```{r lm tune 2}
+best_lm_wf <- lm_tune_wf %>%
+    finalize_workflow(select_best(tune_lm, metric="f_meas"))
+
+lm_cv_tuned <- fit_resamples(best_lm_wf, resamples, metrics=cv_metrics, control=cv_control)
+
+lm_tune_final <- best_lm_wf %>% fit(haiti)
+```
+
+### Formula & recipe
+```{r form rec cv}
+formula <- `Class` ~ .
+
+recipe <- recipe(formula, data=haiti) %>%
+  step_normalize(all_numeric_predictors())
+
+set.seed(1)
+resamples <- vfold_cv(haiti, v=10, strata=Class)
+cv_control <- control_resamples(save_pred=TRUE)
+cv_metrics <- metric_set(roc_auc, accuracy, f_meas)
+custom_metrics <- yardstick::metric_set(accuracy, f_meas, accuracy, sens, spec)
+```
+
+### KNN
+```{r knn}
+nn_tune_metrics <- yardstick::metric_set(f_meas,accuracy,roc_auc)
+nn_roc_metrics <- metric_set(roc_auc)
+nn_custom_metrics <- metric_set(f_meas,accuracy,sens,spec,kap)
+
+nn_recipe <- recipe(formula,data = haiti)
+nn_model <- nearest_neighbor(mode = "classification",neighbors = tune())
+
+nn_wf <- workflow() %>%
+    add_recipe(nn_recipe) %>%
+    add_model(nn_model)
+
+parameters <- extract_parameter_set_dials(nn_wf)
+parameters <- parameters %>%
+    update(
+        neighbors = neighbors(c(1, 20))
+    )
+
+tune_nn <- tune_grid(nn_wf,
+    resamples=resamples,
+    metrics=nn_tune_metrics,
+    grid=grid_random(parameters, size=100))
+autoplot(tune_nn)
+nn_tune_metrics <- show_best(tune_nn, metric="f_meas")
+
+best_nn_wf <- nn_wf %>%
+    finalize_workflow(select_best(tune_nn, metric="f_meas"))
+nn_tune_metrics <- yardstick::metric_set(f_meas,accuracy,roc_auc)
+nn_cv <- fit_resamples(best_nn_wf, resamples, metrics=nn_tune_metrics, control=cv_control)
+nn_cv_predictions <- collect_predictions(nn_cv)
+nn_custom_metrics <- nn_custom_metrics(nn_cv_predictions, truth = Class, estimate = .pred_class)
+nn_roc_metrics <- nn_roc_metrics(nn_cv_predictions,truth = Class, .pred_Blue_Tarp,event_level = "first")
+```
+```{r knn-2}
+knn_tune_final <- best_nn_wf %>% fit(haiti)
+```
+
+```{r lm}
+lm_model <- logistic_reg(mode="classification", engine="glm")
+
+lm_wf <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(lm_model)
+
+lm_cv <- fit_resamples(lm_wf, resamples, metrics=cv_metrics, control=cv_control)
+
+lm_final <- lm_wf %>% fit(haiti)
+```
+
+```{r lda}
+lda_model <- discrim_linear(mode="classification", engine="MASS")
+
+lda_wf <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(lda_model)
+
+lda_cv <- lda_cv <- fit_resamples(lda_wf, resamples, metrics=cv_metrics, control=cv_control)
+
+lda_final <- lda_wf %>% fit(haiti)
+```
+
+```{r qda}
+qda_model <- discrim_quad(mode="classification", engine="MASS")
+
+qda_wf <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(qda_model)
+
+qda_cv <- qda_cv <- fit_resamples(qda_wf, resamples, metrics=cv_metrics, control=cv_control)
+
+qda_final <- qda_wf %>% fit(haiti)
+```
+
+
+### Random Forest
+```{r rf tune 1}
+rf_tune_model <- rand_forest(mode="classification", mtry=tune(), min_n=tune()) %>%
+            set_engine("ranger", importance="impurity")
+
+rf_tune_wf <- workflow() %>%
+    add_recipe(recipe) %>%
+    add_model(rf_tune_model)
+
+rf_params <- extract_parameter_set_dials(rf_tune_wf) %>%
+    update(mtry = mtry(c(1, 3)),
+           min_n= min_n(c(5,15)))
+
+tune_rf <- tune_grid(rf_tune_wf,
+    resamples=resamples,
+    metrics=cv_metrics,
+    param_info=rf_params, iter=25)
+
+autoplot(tune_rf)
+```
+
+```{r rf tune 2}
+best_rf_wf <- rf_tune_wf %>%
+    finalize_workflow(select_best(tune_rf, metric="f_meas"))
+
+rf_cv_tuned <- fit_resamples(best_rf_wf, resamples, metrics=cv_metrics, control=cv_control)
+
+rf_tune_final <- best_rf_wf %>% fit(haiti)
+```
+
+```{r}
+select_best(tune_rf, metric="f_meas")
+```
+
+### Boost
+```{r boost-model}
+boost_tune_metrics <- metric_set(f_meas,accuracy,roc_auc)
+boost_roc_metrics <- metric_set(roc_auc)
+boost_custom_metrics <- metric_set(f_meas,accuracy,sens,spec,kap)
+
+boost_recipe <- recipe(formula,data = haiti)
+boost_model <- boost_tree(mode="classification", trees=100,
+                          learn_rate=tune(),tree_depth=tune()) %>%
+  set_engine("xgboost")
+
+boost_wf <- workflow() %>%
+    add_recipe(boost_recipe) %>%
+    add_model(boost_model)
+
+parameters <- extract_parameter_set_dials(boost_wf)
+
+tune_boost <- tune_grid(boost_wf,
+    resamples=resamples,
+    metrics=boost_tune_metrics,
+    param_info=parameters, iter=25)
+```
+```{r plot-tune-boost}
+autoplot(tune_boost)
+```
+
+```{r boost-cv}
+best_boost_wf <- boost_wf %>%
+    finalize_workflow(select_best(tune_boost, metric="f_meas"))
+boost_cv <- fit_resamples(best_boost_wf, resamples, metrics=boost_tune_metrics, control=cv_control)
+boost_cv_predictions <- collect_predictions(boost_cv)
+#boost_cv_metrics <- cv_metrics(boost_cv_predictions, truth = Class, estimate = .pred_class)
+boost_custom_metrics <- boost_custom_metrics(boost_cv_predictions, truth = Class, estimate = .pred_class)
+boost_roc_metrics <- boost_roc_metrics(boost_cv_predictions,truth = Class, .pred_Blue_Tarp,event_level = "first")
+```
+
+```{r boost-finalize}
+boost_tune_final <- best_boost_wf %>% fit(haiti)
+```
+
+### Linear SVM
+```{r lsvm tune 1}
+lsvm_tune_model <- svm_linear(engine="kernlab",  mode="classification", cost=tune(), margin=tune())
+
+lsvm_tune_wf <- workflow() %>% 
+  add_recipe(recipe) %>% 
+  add_model(lsvm_tune_model)
+
+lsvm_params <- extract_parameter_set_dials(lsvm_tune_wf) %>%
+    update(cost = cost(c(-8,-3)))
+
+tune_lsvm <- tune_grid(lsvm_tune_wf,
+    resamples=resamples,
+    control=cv_control,
+    metrics=cv_metrics,
+    param_info=lsvm_params)
+
+autoplot(tune_lsvm)
+```
+
+```{r lsvm tune 2}
+best_lsvm_wf <- lsvm_tune_wf %>%
+    finalize_workflow(select_best(tune_lsvm, metric="f_meas"))
+
+lsvm_cv_tuned <- fit_resamples(best_lsvm_wf, resamples, metrics=cv_metrics, control=cv_control)
+
+lsvm_tune_final <- best_lsvm_wf %>% fit(haiti)
+```
+
+```{r}
+select_best(tune_lsvm, metric="f_meas")
+```
+
+### Polynomial SVM
+```{r psvm tune 1}
+psvm_tune_model <- svm_poly(engine="kernlab", mode="classification", cost=tune(), margin=tune(), degree=tune())
+
+psvm_tune_wf <- workflow() %>% 
+  add_recipe(recipe) %>% 
+  add_model(psvm_tune_model)
+
+psvm_params <- extract_parameter_set_dials(psvm_tune_wf) %>%
+    update(cost = cost(c(-6,-4)))
+
+tune_psvm <- tune_grid(psvm_tune_wf,
+    resamples=resamples,
+    control=cv_control,
+    metrics=cv_metrics,
+    param_info=psvm_params)
+
+autoplot(tune_psvm)
+```
+
+```{r psvm tune 2}
+best_psvm_wf <- psvm_tune_wf %>%
+    finalize_workflow(select_best(tune_psvm, metric="f_meas"))
+
+psvm_cv_tuned <- fit_resamples(best_psvm_wf, resamples, metrics=cv_metrics, control=cv_control)
+
+psvm_tune_final <- best_psvm_wf %>% fit(haiti)
+```
+
+```{r}
+select_best(tune_psvm, metric="f_meas")
+```
+
+
+```{r rbfsvm tune 1}
+rbfsvm_tune_model <- svm_rbf(engine="kernlab", mode="classification", cost=tune(), margin=tune(), rbf_sigma=tune())
+
+rbfsvm_tune_wf <- workflow() %>% 
+  add_recipe(recipe) %>% 
+  add_model(rbfsvm_tune_model)
+
+rbfsvm_params <- extract_parameter_set_dials(rbfsvm_tune_wf) %>%
+    update(#cost = cost(c(1.5,2.5)),
+           rbf_sigma = rbf_sigma(range=c(-4, 0)))
+
+tune_rbfsvm <- tune_grid(rbfsvm_tune_wf,
+    resamples=resamples,
+    control=cv_control,
+    metrics=cv_metrics,
+    param_info=rbfsvm_params)
+
+autoplot(tune_rbfsvm)
+```
+
+
+```{r rbfsvm tune 2}
+best_rbfsvm_wf <- rbfsvm_tune_wf %>%
+    finalize_workflow(select_best(tune_rbfsvm, metric="f_meas"))
+
+rbfsvm_cv_tuned <- fit_resamples(best_rbfsvm_wf, resamples, metrics=cv_metrics, control=cv_control)
+
+rbfsvm_tune_final <- best_rbfsvm_wf %>% fit(haiti)
+```
+
+```{r}
+select_best(tune_rbfsvm, metric="f_meas")
+```
+
+```{r cv metrics}
+modelcv_metrics <- bind_rows(
+    collect_metrics(lm_cv) %>%
+        mutate(model="Logistic Regression"),
+    collect_metrics(lda_cv) %>%
+        mutate(model="LDA"),    
+    collect_metrics(qda_cv) %>%
+        mutate(model="QDA"),
+    collect_metrics(lm_cv_tuned) %>%
+        mutate(model="Tuned Logistic Regression"),
+    collect_metrics(nn_cv) %>%
+        mutate(model="Tuned KNN"),
+    collect_metrics(rf_cv_tuned) %>%
+        mutate(model="Tuned Random Forest"),
+    collect_metrics(boost_cv) %>%
+        mutate(model="Tuned Boost"),
+    collect_metrics(lsvm_cv_tuned) %>%
+        mutate(model="Tuned Linear SVM"),
+    collect_metrics(psvm_cv_tuned) %>%
+        mutate(model="Tuned Polynomial SVM"),
+    collect_metrics(rbfsvm_cv_tuned) %>%
+        mutate(model="Tuned RBF SVM")
+)
+
+modelcv_metrics %>%
+    select(model, .metric, mean) %>%
+    pivot_wider(names_from=".metric", values_from="mean") %>%
+    knitr::kable(caption="Cross-validation performance metrics", digits=3)
+```
+
+
+```{r cv predictions}
+lm_cv_preds <- collect_predictions(lm_cv)
+
+lda_cv_preds <- collect_predictions(lda_cv)
+
+qda_cv_preds <- collect_predictions(qda_cv)
+
+knn_cv_tuned_preds <- collect_predictions(nn_cv)
+
+lm_cv_tuned_preds <- collect_predictions(lm_cv_tuned)
+
+rf_cv_tuned_preds <- collect_predictions(rf_cv_tuned)
+
+boost_cv_tuned_preds <- collect_predictions(boost_cv)
+
+lsvm_cv_tuned_preds <- collect_predictions(lsvm_cv_tuned)
+
+psvm_cv_tuned_preds <- collect_predictions(psvm_cv_tuned)
+
+rbfsvm_cv_tuned_preds <- collect_predictions(rbfsvm_cv_tuned)
+
+```
+
+```{r cv-threshold}
+#| warning: FALSE
+#| message: FALSE
+ #Define function to identify threshold for CV models
+ threshold_cv <- function(model_predictions_cv) {
+     performance <- model_predictions_cv %>%
+       probably::threshold_perf(Class, .pred_Blue_Tarp,
+         thresholds=seq(0.05, 0.95, 0.05), event_level="first",
+         metrics=metric_set(f_meas))
+     max_metrics <- performance %>%
+         drop_na() %>%
+         group_by(.metric) %>%
+         filter(.estimate == max(.estimate))
+     threshold <- max_metrics %>%
+         select(.metric, .threshold) %>%
+         deframe()
+     return(threshold=threshold)
+ }
+
+ # Use function to define threshold for CV models
+ lm_cv_threshold <- threshold_cv(lm_cv_preds)
+ lda_cv_threshold <- threshold_cv(lda_cv_preds)
+ qda_cv_threshold <- threshold_cv(qda_cv_preds)
+
+ lm_cv_predict_threshold <- lm_cv_preds %>%
+     mutate(.pred_class = factor(ifelse(.pred_Blue_Tarp >= lm_cv_threshold, "Blue_Tarp", "Non_Tarp")))
+ lda_cv_predict_threshold <- lda_cv_preds %>%
+     mutate(.pred_class = factor(ifelse(.pred_Blue_Tarp >= lda_cv_threshold, "Blue_Tarp", "Non_Tarp")))
+ qda_cv_predict_threshold <- qda_cv_preds%>%
+     mutate(.pred_class = factor(ifelse(.pred_Blue_Tarp >= qda_cv_threshold, "Blue_Tarp", "Non_Tarp")))
+```
+
+```{r cv roc}
+rocgraph_cv <- bind_rows(lm_cv_predict_threshold  %>%
+                           mutate(model="Logistic Regression Threshold"),
+                         lda_cv_predict_threshold  %>%
+                           mutate(model="LDA Threshold"),
+                         qda_cv_predict_threshold  %>%
+                           mutate(model="QDA Threshold"),
+                         knn_cv_tuned_preds  %>%
+                           mutate(model="Tuned KNN"),
+                         lm_cv_tuned_preds  %>%
+                           mutate(model="Tuned Logistic Regression"),
+                         rf_cv_tuned_preds  %>%
+                           mutate(model="Tuned Random Forest"),
+                         boost_cv_tuned_preds  %>%
+                           mutate(model="Tuned Boost"),
+                         lsvm_cv_tuned_preds  %>%
+                           mutate(model="Tuned Linear SVM"),
+                         psvm_cv_tuned_preds  %>%
+                           mutate(model="Tuned Polynomial SVM"),
+                         rbfsvm_cv_tuned_preds  %>%
+                           mutate(model="Tuned RBF SVM"),
+                      ) %>% 
+  group_by(model) %>%
+  roc_curve(truth=Class, .pred_Blue_Tarp, event_level="first") %>%
+  autoplot()
+
+rocgraph_cv_zoom <- rocgraph_cv +
+  coord_cartesian(xlim=c(0, 0.15), ylim=c(0.85, 1)) +
+  guides(colour="none")
+
+rocgraph_cv + rocgraph_cv_zoom
+```
+
+```{r threshold-scan}
+#| fig.cap: Figure 13. Threshold Scan of Each Classification Model using the F-Measure
+#| out.width: 90%
+#| fig.width: 10
+#| fig.height: 4
+#| warning: FALSE
+#| message: FALSE
+threshold_scan <- function(model, data, model_name) {
+    threshold_data <- model %>%
+        augment(data) %>%
+        probably::threshold_perf(Class, .pred_Blue_Tarp,
+            thresholds=seq(0.05, 0.95, 0.01), event_level="first",
+            metrics=metric_set(f_meas))
+    opt_threshold <- threshold_data %>%
+        arrange(-.estimate) %>%
+        first()
+    g <- ggplot(threshold_data, aes(x=.threshold, y=.estimate)) +
+        geom_line() +
+        geom_point(data=opt_threshold, color="red", size=2) +
+        labs(title=model_name, x="Threshold", y="F Measure") +
+        coord_cartesian(ylim=c(0.2, 1))
+    return(list(
+        graph=g,
+        threshold=opt_threshold %>%
+            pull(.threshold)
+    ))
+}
+
+g1 <- threshold_scan(lm_final, haiti, "Logistic Regression")
+g2 <- threshold_scan(lda_final, haiti, "LDA")
+g3 <- threshold_scan(qda_final, haiti, "QDA")
+
+lm_threshold <- g1$threshold
+lda_threshold <- g2$threshold
+qda_threshold <- g3$threshold
+
+g1$graph + g2$graph + g3$graph + plot_layout(ncol = 3,widths = c(3,3,3))
+```
+
+
+```{r model-predictions}
+#| warning: FALSE
+#| message: FALSE
+predict_at_threshold <- function(model, data, threshold) {
+    return(
+        model %>%
+            augment(data) %>%
+            mutate(.pred_class = factor(make_two_class_pred(.pred_Blue_Tarp,
+                    c("Blue_Tarp", "Non_Tarp"), threshold=threshold), levels = c("Blue_Tarp","Non_Tarp"))
+            )
+    )
+}
+
+lm_train_predict <- predict_at_threshold(lm_final, haiti, lm_threshold)
+lm_test_predict <- predict_at_threshold(lm_final, total_holdout, lm_threshold)
+lda_train_predict <- predict_at_threshold(lda_final, haiti, lda_threshold)
+lda_test_predict <- predict_at_threshold(lda_final, total_holdout, lda_threshold)
+qda_train_predict <- predict_at_threshold(qda_final, haiti, qda_threshold)
+qda_test_predict <- predict_at_threshold(qda_final, total_holdout, qda_threshold)
+lm_tune_train_predict <- lm_tune_final %>% augment(haiti) #%>% 
+                          #mutate(.pred_class = factor(make_two_class_pred(.pred_Blue_Tarp,c("Blue_Tarp", "Non_Tarp")), levels=c("Blue_Tarp","Non_Tarp")))
+lm_tune_test_predict <- lm_tune_final %>% augment(total_holdout) #%>% 
+                        #mutate(.pred_class = factor(make_two_class_pred(.pred_Blue_Tarp,c("Blue_Tarp", "Non_Tarp")), levels=c("Blue_Tarp","Non_Tarp")))
+knn_tune_train_predict <- knn_tune_final %>% augment(haiti) #%>% 
+                          #mutate(.pred_class = factor(make_two_class_pred(.pred_Blue_Tarp,c("Blue_Tarp", "Non_Tarp")), levels=c("Blue_Tarp","Non_Tarp")))
+knn_tune_test_predict <- knn_tune_final %>% augment(total_holdout) #%>%  
+                          #mutate(.pred_class = factor(make_two_class_pred(.pred_Blue_Tarp,c("Blue_Tarp", "Non_Tarp")), levels=c("Blue_Tarp","Non_Tarp")))
+rf_tune_train_predict <- rf_tune_final %>% augment(haiti) #%>% 
+                         #mutate(.pred_class = factor(make_two_class_pred(.pred_Blue_Tarp,c("Blue_Tarp", "Non_Tarp")), levels=c("Blue_Tarp","Non_Tarp")))
+rf_tune_test_predict <- rf_tune_final %>% augment(total_holdout) #%>% 
+                        #mutate(.pred_class = factor(make_two_class_pred(.pred_Blue_Tarp,c("Blue_Tarp", "Non_Tarp")), levels=c("Blue_Tarp","Non_Tarp")))
+boost_tune_train_predict <- boost_tune_final %>% augment(haiti) #%>% 
+                            #mutate(.pred_class = factor(make_two_class_pred(.pred_Blue_Tarp,c("Blue_Tarp", "Non_Tarp")), levels=c("Blue_Tarp","Non_Tarp")))
+boost_tune_test_predict <- boost_tune_final %>% augment(total_holdout) #%>% 
+                           #mutate(.pred_class = factor(make_two_class_pred(.pred_Blue_Tarp,c("Blue_Tarp", "Non_Tarp")), levels=c("Blue_Tarp","Non_Tarp")))
+lsvm_tune_train_predict <- lsvm_tune_final %>% augment(haiti) #%>% 
+                          #mutate(.pred_class = factor(make_two_class_pred(.pred_Blue_Tarp,c("Blue_Tarp", "Non_Tarp")), levels=c("Blue_Tarp","Non_Tarp")))
+lsvm_tune_test_predict <- lsvm_tune_final %>% augment(total_holdout) #%>% 
+                          #mutate(.pred_class = factor(make_two_class_pred(.pred_Blue_Tarp,c("Blue_Tarp", "Non_Tarp")), levels=c("Blue_Tarp","Non_Tarp")))
+psvm_tune_train_predict <- psvm_tune_final %>% augment(haiti) #%>% 
+                           #mutate(.pred_class = factor(make_two_class_pred(.pred_Blue_Tarp,c("Blue_Tarp", "Non_Tarp")), levels=c("Blue_Tarp","Non_Tarp")))
+psvm_tune_test_predict <- psvm_tune_final %>% augment(total_holdout) #%>% 
+                          #mutate(.pred_class = factor(make_two_class_pred(.pred_Blue_Tarp,c("Blue_Tarp", "Non_Tarp")), levels=c("Blue_Tarp","Non_Tarp")))
+rbfsvm_tune_train_predict <- rbfsvm_tune_final %>% augment(haiti) #%>% 
+                             #mutate(.pred_class = factor(make_two_class_pred(.pred_Blue_Tarp,c("Blue_Tarp", "Non_Tarp")), levels=c("Blue_Tarp","Non_Tarp")))
+rbfsvm_tune_test_predict <- rbfsvm_tune_final %>% augment(total_holdout) #%>% 
+                            #mutate(.pred_class = factor(make_two_class_pred(.pred_Blue_Tarp,c("Blue_Tarp", "Non_Tarp")), levels=c("Blue_Tarp","Non_Tarp")))
+
+calculate_roc_at_threshold <- function(model, data, threshold) {
+    bind_rows(
+        # AUC of ROC curve of training set
+        bind_cols(
+            threshold=threshold,
+            roc_auc(model %>% augment(data), Class, .pred_Blue_Tarp, event_level="first"),
+        ),
+    )
+}
+
+lm_train_roc <- calculate_roc_at_threshold(lm_final, haiti, lm_threshold)
+lda_train_roc <- calculate_roc_at_threshold(lda_final, haiti, lda_threshold)
+qda_train_roc <- calculate_roc_at_threshold(qda_final, haiti, qda_threshold)
+lm_test_roc <- calculate_roc_at_threshold(lm_final, total_holdout, lm_threshold)
+lda_test_roc <- calculate_roc_at_threshold(lda_final, total_holdout, lda_threshold)
+qda_test_roc <- calculate_roc_at_threshold(qda_final, total_holdout, qda_threshold)
+lm_tuned_train_roc <- roc_auc(lm_tune_train_predict, Class, .pred_Blue_Tarp, event_level="first")
+lm_tuned_test_roc <- roc_auc(lm_tune_test_predict, Class, .pred_Blue_Tarp, event_level="first")
+knn_tuned_train_roc <- roc_auc(knn_tune_train_predict, Class, .pred_Blue_Tarp, event_level="first")
+knn_tuned_test_roc <- roc_auc(knn_tune_test_predict, Class, .pred_Blue_Tarp, event_level="first")
+rf_tuned_train_roc <- roc_auc(rf_tune_train_predict, Class, .pred_Blue_Tarp, event_level="first")
+rf_tuned_test_roc <- roc_auc(rf_tune_test_predict, Class, .pred_Blue_Tarp, event_level="first")
+boost_tuned_train_roc <- roc_auc(boost_tune_train_predict, Class, .pred_Blue_Tarp, event_level="first")
+boost_tuned_test_roc <- roc_auc(boost_tune_test_predict, Class, .pred_Blue_Tarp, event_level="first")
+lsvm_tuned_train_roc <- roc_auc(lsvm_tune_train_predict, Class, .pred_Blue_Tarp, event_level="first")
+lsvm_tuned_test_roc <- roc_auc(lsvm_tune_test_predict, Class, .pred_Blue_Tarp, event_level="first")
+psvm_tuned_train_roc <- roc_auc(psvm_tune_train_predict, Class, .pred_Blue_Tarp, event_level="first")
+psvm_tuned_test_roc <- roc_auc(psvm_tune_test_predict, Class, .pred_Blue_Tarp, event_level="first")
+rbfsvm_tuned_train_roc <- roc_auc(rbfsvm_tune_train_predict, Class, .pred_Blue_Tarp, event_level="first")
+rbfsvm_tuned_test_roc <- roc_auc(rbfsvm_tune_test_predict, Class, .pred_Blue_Tarp, event_level="first")
+```
+
+```{r train roc}
+rocgraph_train <- bind_rows(lm_train_predict  %>%
+                           mutate(model="Logistic Regression Threshold"),
+                         lda_train_predict  %>%
+                           mutate(model="LDA Threshold"),
+                         qda_train_predict  %>%
+                           mutate(model="QDA Threshold"),
+                         knn_tune_train_predict  %>%
+                           mutate(model="Tuned KNN"),
+                         lm_tune_train_predict  %>%
+                           mutate(model="Tuned Logistic Regression"),
+                         rf_tune_train_predict  %>%
+                           mutate(model="Tuned Random Forest"),
+                         boost_tune_train_predict  %>%
+                           mutate(model="Tuned Boost"),
+                         lsvm_tune_train_predict  %>%
+                           mutate(model="Tuned Linear SVM"),
+                         psvm_tune_train_predict  %>%
+                           mutate(model="Tuned Polynomial SVM"),
+                         rbfsvm_tune_train_predict  %>%
+                           mutate(model="Tuned RBF SVM"),
+                      ) %>% 
+  group_by(model) %>%
+  roc_curve(truth=Class, .pred_Blue_Tarp, event_level="first") %>%
+  autoplot()
+
+rocgraph_train_zoom <- rocgraph_train +
+  coord_cartesian(xlim=c(0, 0.15), ylim=c(0.85, 1)) +
+  guides(colour="none")
+
+rocgraph_train + rocgraph_train_zoom
+```
+
+```{r test roc}
+rocgraph_test <- bind_rows(lm_test_predict  %>%
+                           mutate(model="Logistic Regression Threshold"),
+                         lda_test_predict  %>%
+                           mutate(model="LDA Threshold"),
+                         qda_test_predict  %>%
+                           mutate(model="QDA Threshold"),
+                         knn_tune_test_predict  %>%
+                           mutate(model="Tuned KNN"),
+                         lm_tune_test_predict  %>%
+                           mutate(model="Tuned Logistic Regression"),
+                         rf_tune_test_predict  %>%
+                           mutate(model="Tuned Random Forest"),
+                         boost_tune_test_predict  %>%
+                           mutate(model="Tuned Boost"),
+                         lsvm_tune_test_predict  %>%
+                           mutate(model="Tuned Linear SVM"),
+                         psvm_tune_test_predict  %>%
+                           mutate(model="Tuned Polynomial SVM"),
+                         rbfsvm_tune_test_predict  %>%
+                           mutate(model="Tuned RBF SVM"),
+                      ) %>% 
+  group_by(model) %>%
+  roc_curve(truth=Class, .pred_Blue_Tarp, event_level="first") %>%
+  autoplot()
+
+rocgraph_test_zoom <- rocgraph_test +
+  coord_cartesian(xlim=c(0, 0.15), ylim=c(0.85, 1)) +
+  guides(colour="none")
+
+rocgraph_test + rocgraph_test_zoom
+```
+
+```{r calculate pr}
+calculate_pr_at_threshold <- function(model, data, threshold) {
+    bind_rows(
+        bind_cols(
+            threshold=threshold,
+            pr_auc(model %>% augment(data), Class, .pred_Blue_Tarp, event_level="first"),
+        ),
+    )
+}
+
+lm_train_pr <- calculate_pr_at_threshold(lm_final, haiti, lm_threshold)
+lda_train_pr <- calculate_pr_at_threshold(lda_final, haiti, lda_threshold)
+qda_train_pr <- calculate_pr_at_threshold(qda_final, haiti, qda_threshold)
+lm_test_pr <- calculate_pr_at_threshold(lm_final, total_holdout, lm_threshold)
+lda_test_pr <- calculate_pr_at_threshold(lda_final, total_holdout, lda_threshold)
+qda_test_pr <- calculate_pr_at_threshold(qda_final, total_holdout, qda_threshold)
+lm_tuned_train_pr <- pr_auc(lm_tune_train_predict, Class, .pred_Blue_Tarp, event_level="first")
+lm_tuned_test_pr <- pr_auc(lm_tune_test_predict, Class, .pred_Blue_Tarp, event_level="first")
+knn_tuned_train_pr <- pr_auc(knn_tune_train_predict, Class, .pred_Blue_Tarp, event_level="first")
+knn_tuned_test_pr <- pr_auc(knn_tune_test_predict, Class, .pred_Blue_Tarp, event_level="first")
+rf_tuned_train_pr <- pr_auc(rf_tune_train_predict, Class, .pred_Blue_Tarp, event_level="first")
+rf_tuned_test_pr <- pr_auc(rf_tune_test_predict, Class, .pred_Blue_Tarp, event_level="first")
+boost_tuned_train_pr <- pr_auc(boost_tune_train_predict, Class, .pred_Blue_Tarp, event_level="first")
+boost_tuned_test_pr <- pr_auc(boost_tune_test_predict, Class, .pred_Blue_Tarp, event_level="first")
+lsvm_tuned_train_pr <- pr_auc(lsvm_tune_train_predict, Class, .pred_Blue_Tarp, event_level="first")
+lsvm_tuned_test_pr <- pr_auc(lsvm_tune_test_predict, Class, .pred_Blue_Tarp, event_level="first")
+psvm_tuned_train_pr <- pr_auc(psvm_tune_train_predict, Class, .pred_Blue_Tarp, event_level="first")
+psvm_tuned_test_pr <- pr_auc(psvm_tune_test_predict, Class, .pred_Blue_Tarp, event_level="first")
+rbfsvm_tuned_train_pr <- pr_auc(rbfsvm_tune_train_predict, Class, .pred_Blue_Tarp, event_level="first")
+rbfsvm_tuned_test_pr <- pr_auc(rbfsvm_tune_test_predict, Class, .pred_Blue_Tarp, event_level="first")
+```
+
+
+
+```{r train pr}
+prgraph_train <- bind_rows(lm_train_predict  %>%
+                           mutate(model="Logistic Regression Threshold"),
+                         lda_train_predict  %>%
+                           mutate(model="LDA Threshold"),
+                         qda_train_predict  %>%
+                           mutate(model="QDA Threshold"),
+                         knn_tune_train_predict  %>%
+                           mutate(model="Tuned KNN"),
+                         lm_tune_train_predict  %>%
+                           mutate(model="Tuned Logistic Regression"),
+                         rf_tune_train_predict  %>%
+                           mutate(model="Tuned Random Forest"),
+                         boost_tune_train_predict  %>%
+                           mutate(model="Tuned Boost"),
+                         lsvm_tune_train_predict  %>%
+                           mutate(model="Tuned Linear SVM"),
+                         psvm_tune_train_predict  %>%
+                           mutate(model="Tuned Polynomial SVM"),
+                         rbfsvm_tune_train_predict  %>%
+                           mutate(model="Tuned RBF SVM"),
+                      ) %>% 
+  group_by(model) %>%
+  pr_curve(truth=Class, .pred_Blue_Tarp, event_level="first") %>%
+  autoplot()
+
+#prgraph_train_zoom <- prgraph_train +
+#  coord_cartesian(xlim=c(0, 0.15), ylim=c(0.85, 1)) +
+#  guides(colour="none")
+
+prgraph_train
+```
+
+```{r test pr}
+prgraph_test <- bind_rows(lm_test_predict  %>%
+                           mutate(model="Logistic Regression Threshold"),
+                         lda_test_predict  %>%
+                           mutate(model="LDA Threshold"),
+                         qda_test_predict  %>%
+                           mutate(model="QDA Threshold"),
+                         knn_tune_test_predict  %>%
+                           mutate(model="Tuned KNN"),
+                         lm_tune_test_predict  %>%
+                           mutate(model="Tuned Logistic Regression"),
+                         rf_tune_test_predict  %>%
+                           mutate(model="Tuned Random Forest"),
+                         boost_tune_test_predict  %>%
+                           mutate(model="Tuned Boost"),
+                         lsvm_tune_test_predict  %>%
+                           mutate(model="Tuned Linear SVM"),
+                         psvm_tune_test_predict  %>%
+                           mutate(model="Tuned Polynomial SVM"),
+                         rbfsvm_tune_test_predict  %>%
+                           mutate(model="Tuned RBF SVM"),
+                      ) %>% 
+  group_by(model) %>%
+  pr_curve(truth=Class, .pred_Blue_Tarp, event_level="first") %>%
+  autoplot()
+
+#prgraph_test_zoom <- prgraph_test +
+#  coord_cartesian(xlim=c(0, 0.15), ylim=c(0.85, 1)) +
+#  guides(colour="none")
+
+prgraph_test
+```
+
+
+```{r confusion matrix calcs}
+lm_train_cm <- confusionMatrix(data = lm_train_predict$.pred_class, reference = haiti$Class)
+lm_train_accuracy <- lm_train_cm$overall["Accuracy"]
+lm_train_tpr <- lm_train_cm$byClass["Sensitivity"]
+lm_train_fpr <- 1 - lm_train_cm$byClass["Specificity"]
+lm_train_precision <- lm_train_cm$byClass["Precision"]
+lm_train_f1_score <- lm_train_cm$byClass["F1"]
+
+lm_test_cm <- confusionMatrix(data = lm_test_predict$.pred_class, reference = total_holdout$Class)
+lm_test_accuracy <- lm_test_cm$overall["Accuracy"]
+lm_test_tpr <- lm_test_cm$byClass["Sensitivity"]
+lm_test_fpr <- 1 - lm_test_cm$byClass["Specificity"]
+lm_test_precision <- lm_test_cm$byClass["Precision"]
+lm_test_f1_score <- lm_test_cm$byClass["F1"]
+
+lda_train_cm <- confusionMatrix(data = lda_train_predict$.pred_class, reference = haiti$Class)
+lda_train_accuracy <- lda_train_cm$overall["Accuracy"]
+lda_train_tpr <- lda_train_cm$byClass["Sensitivity"]
+lda_train_fpr <- 1 - lda_train_cm$byClass["Specificity"]
+lda_train_precision <- lda_train_cm$byClass["Precision"]
+lda_train_f1_score <- lda_train_cm$byClass["F1"]
+
+lda_test_cm <- confusionMatrix(data = lda_test_predict$.pred_class, reference = total_holdout$Class)
+lda_test_accuracy <- lda_test_cm$overall["Accuracy"]
+lda_test_tpr <- lda_test_cm$byClass["Sensitivity"]
+lda_test_fpr <- 1 - lda_test_cm$byClass["Specificity"]
+lda_test_precision <- lda_test_cm$byClass["Precision"]
+lda_test_f1_score <- lda_test_cm$byClass["F1"]
+
+qda_train_cm <- confusionMatrix(data = qda_train_predict$.pred_class, reference = haiti$Class)
+qda_train_accuracy <- qda_train_cm$overall["Accuracy"]
+qda_train_tpr <- qda_train_cm$byClass["Sensitivity"]
+qda_train_fpr <- 1 - qda_train_cm$byClass["Specificity"]
+qda_train_precision <- qda_train_cm$byClass["Precision"]
+qda_train_f1_score <- qda_train_cm$byClass["F1"]
+
+qda_test_cm <- confusionMatrix(data = qda_test_predict$.pred_class, reference = total_holdout$Class)
+qda_test_accuracy <- qda_test_cm$overall["Accuracy"]
+qda_test_tpr <- qda_test_cm$byClass["Sensitivity"]
+qda_test_fpr <- 1 - qda_test_cm$byClass["Specificity"]
+qda_test_precision <- qda_test_cm$byClass["Precision"]
+qda_test_f1_score <- qda_test_cm$byClass["F1"]
+
+lm_tuned_train_cm <- confusionMatrix(data = lm_tune_train_predict$.pred_class, reference = haiti$Class)
+lm_tuned_train_accuracy <- lm_tuned_train_cm$overall["Accuracy"]
+lm_tuned_train_tpr <- lm_tuned_train_cm$byClass["Sensitivity"]
+lm_tuned_train_fpr <- 1 - lm_tuned_train_cm$byClass["Specificity"]
+lm_tuned_train_precision <- lm_tuned_train_cm$byClass["Precision"]
+lm_tuned_train_f1_score <- lm_tuned_train_cm$byClass["F1"]
+
+lm_tuned_test_cm <- confusionMatrix(data = lm_tune_test_predict$.pred_class, reference = total_holdout$Class)
+lm_tuned_test_accuracy <- lm_tuned_test_cm$overall["Accuracy"]
+lm_tuned_test_tpr <- lm_tuned_test_cm$byClass["Sensitivity"]
+lm_tuned_test_fpr <- 1 - lm_tuned_test_cm$byClass["Specificity"]
+lm_tuned_test_precision <- lm_tuned_test_cm$byClass["Precision"]
+lm_tuned_test_f1_score <- lm_tuned_test_cm$byClass["F1"]
+
+knn_tuned_train_cm <- confusionMatrix(data = knn_tune_train_predict$.pred_class, reference = haiti$Class)
+knn_tuned_train_accuracy <- knn_tuned_train_cm$overall["Accuracy"]
+knn_tuned_train_tpr <- knn_tuned_train_cm$byClass["Sensitivity"]
+knn_tuned_train_fpr <- 1 - knn_tuned_train_cm$byClass["Specificity"]
+knn_tuned_train_precision <- knn_tuned_train_cm$byClass["Precision"]
+knn_tuned_train_f1_score <- knn_tuned_train_cm$byClass["F1"]
+
+knn_tuned_test_cm <- confusionMatrix(data = knn_tune_test_predict$.pred_class, reference = total_holdout$Class)
+knn_tuned_test_accuracy <- knn_tuned_test_cm$overall["Accuracy"]
+knn_tuned_test_tpr <- knn_tuned_test_cm$byClass["Sensitivity"]
+knn_tuned_test_fpr <- 1 - knn_tuned_test_cm$byClass["Specificity"]
+knn_tuned_test_precision <- knn_tuned_test_cm$byClass["Precision"]
+knn_tuned_test_f1_score <- knn_tuned_test_cm$byClass["F1"]
+
+rf_tuned_train_cm <- confusionMatrix(data = rf_tune_train_predict$.pred_class, reference = haiti$Class)
+rf_tuned_train_accuracy <- rf_tuned_train_cm$overall["Accuracy"]
+rf_tuned_train_tpr <- rf_tuned_train_cm$byClass["Sensitivity"]
+rf_tuned_train_fpr <- 1 - rf_tuned_train_cm$byClass["Specificity"]
+rf_tuned_train_precision <- rf_tuned_train_cm$byClass["Precision"]
+rf_tuned_train_f1_score <- rf_tuned_train_cm$byClass["F1"]
+
+rf_tuned_test_cm <- confusionMatrix(data = rf_tune_test_predict$.pred_class, reference = total_holdout$Class)
+rf_tuned_test_accuracy <- rf_tuned_test_cm$overall["Accuracy"]
+rf_tuned_test_tpr <- rf_tuned_test_cm$byClass["Sensitivity"]
+rf_tuned_test_fpr <- 1 - rf_tuned_test_cm$byClass["Specificity"]
+rf_tuned_test_precision <- rf_tuned_test_cm$byClass["Precision"]
+rf_tuned_test_f1_score <- rf_tuned_test_cm$byClass["F1"]
+
+boost_tuned_train_cm <- confusionMatrix(data = boost_tune_train_predict$.pred_class, reference = haiti$Class)
+boost_tuned_train_accuracy <- boost_tuned_train_cm$overall["Accuracy"]
+boost_tuned_train_tpr <- boost_tuned_train_cm$byClass["Sensitivity"]
+boost_tuned_train_fpr <- 1 - boost_tuned_train_cm$byClass["Specificity"]
+boost_tuned_train_precision <- boost_tuned_train_cm$byClass["Precision"]
+boost_tuned_train_f1_score <- boost_tuned_train_cm$byClass["F1"]
+
+boost_tuned_test_cm <- confusionMatrix(data = boost_tune_test_predict$.pred_class, reference = total_holdout$Class)
+boost_tuned_test_accuracy <- boost_tuned_test_cm$overall["Accuracy"]
+boost_tuned_test_tpr <- boost_tuned_test_cm$byClass["Sensitivity"]
+boost_tuned_test_fpr <- 1 - boost_tuned_test_cm$byClass["Specificity"]
+boost_tuned_test_precision <- boost_tuned_test_cm$byClass["Precision"]
+boost_tuned_test_f1_score <- boost_tuned_test_cm$byClass["F1"]
+
+lsvm_tuned_train_cm <- confusionMatrix(data = lsvm_tune_train_predict$.pred_class, reference = haiti$Class)
+lsvm_tuned_train_accuracy <- lsvm_tuned_train_cm$overall["Accuracy"]
+lsvm_tuned_train_tpr <- lsvm_tuned_train_cm$byClass["Sensitivity"]
+lsvm_tuned_train_fpr <- 1 - lsvm_tuned_train_cm$byClass["Specificity"]
+lsvm_tuned_train_precision <- lsvm_tuned_train_cm$byClass["Precision"]
+lsvm_tuned_train_f1_score <- lsvm_tuned_train_cm$byClass["F1"]
+
+lsvm_tuned_test_cm <- confusionMatrix(data = lsvm_tune_test_predict$.pred_class, reference = total_holdout$Class)
+lsvm_tuned_test_accuracy <- lsvm_tuned_test_cm$overall["Accuracy"]
+lsvm_tuned_test_tpr <- lsvm_tuned_test_cm$byClass["Sensitivity"]
+lsvm_tuned_test_fpr <- 1 - lsvm_tuned_test_cm$byClass["Specificity"]
+lsvm_tuned_test_precision <- lsvm_tuned_test_cm$byClass["Precision"]
+lsvm_tuned_test_f1_score <- lsvm_tuned_test_cm$byClass["F1"]
+
+psvm_tuned_train_cm <- confusionMatrix(data = psvm_tune_train_predict$.pred_class, reference = haiti$Class)
+psvm_tuned_train_accuracy <- psvm_tuned_train_cm$overall["Accuracy"]
+psvm_tuned_train_tpr <- psvm_tuned_train_cm$byClass["Sensitivity"]
+psvm_tuned_train_fpr <- 1 - psvm_tuned_train_cm$byClass["Specificity"]
+psvm_tuned_train_precision <- psvm_tuned_train_cm$byClass["Precision"]
+psvm_tuned_train_f1_score <- psvm_tuned_train_cm$byClass["F1"]
+
+psvm_tuned_test_cm <- confusionMatrix(data = psvm_tune_test_predict$.pred_class, reference = total_holdout$Class)
+psvm_tuned_test_accuracy <- psvm_tuned_test_cm$overall["Accuracy"]
+psvm_tuned_test_tpr <- psvm_tuned_test_cm$byClass["Sensitivity"]
+psvm_tuned_test_fpr <- 1 - psvm_tuned_test_cm$byClass["Specificity"]
+psvm_tuned_test_precision <- psvm_tuned_test_cm$byClass["Precision"]
+psvm_tuned_test_f1_score <- psvm_tuned_test_cm$byClass["F1"]
+
+rbfsvm_tuned_train_cm <- confusionMatrix(data = rbfsvm_tune_train_predict$.pred_class, reference = haiti$Class)
+rbfsvm_tuned_train_accuracy <- rbfsvm_tuned_train_cm$overall["Accuracy"]
+rbfsvm_tuned_train_tpr <- rbfsvm_tuned_train_cm$byClass["Sensitivity"]
+rbfsvm_tuned_train_fpr <- 1 - rbfsvm_tuned_train_cm$byClass["Specificity"]
+rbfsvm_tuned_train_precision <- rbfsvm_tuned_train_cm$byClass["Precision"]
+rbfsvm_tuned_train_f1_score <- rbfsvm_tuned_train_cm$byClass["F1"]
+
+rbfsvm_tuned_test_cm <- confusionMatrix(data = rbfsvm_tune_test_predict$.pred_class, reference = total_holdout$Class)
+rbfsvm_tuned_test_accuracy <- rbfsvm_tuned_test_cm$overall["Accuracy"]
+rbfsvm_tuned_test_tpr <- rbfsvm_tuned_test_cm$byClass["Sensitivity"]
+rbfsvm_tuned_test_fpr <- 1 - rbfsvm_tuned_test_cm$byClass["Specificity"]
+rbfsvm_tuned_test_precision <- rbfsvm_tuned_test_cm$byClass["Precision"]
+rbfsvm_tuned_test_f1_score <- rbfsvm_tuned_test_cm$byClass["F1"]
+
+```
+
+
+```{r}
+train_metric <- bind_rows(
+  bind_cols(
+    model="Logistic Regression",
+    dataset="Train",
+    ROC = lm_train_roc$.estimate,
+    PR = lm_train_pr$.estimate,
+    Threshold = lm_threshold,
+    Accuracy = lm_train_accuracy,
+    TPR = lm_train_tpr,
+    FPR  = lm_train_fpr,
+    Precision = lm_train_precision,
+    F_meas = lm_train_f1_score
+      ),
+  bind_cols(
+    model="LDA",
+    dataset="Train",
+    ROC = lda_train_roc$.estimate,
+    PR = lda_train_pr$.estimate,
+    Threshold = lda_threshold,
+    Accuracy = lda_train_accuracy,
+    TPR = lda_train_tpr,
+    FPR  = lda_train_fpr,
+    Precision = lda_train_precision,
+    F_meas = lda_train_f1_score
+      ),
+  bind_cols(
+    model="QDA",
+    dataset="Train",
+    ROC = qda_train_roc$.estimate,
+    PR = qda_train_pr$.estimate,
+    Threshold = qda_threshold,
+    Accuracy = qda_train_accuracy,
+    TPR = qda_train_tpr,
+    FPR  = qda_train_fpr,
+    Precision = qda_train_precision,
+    F_meas = qda_train_f1_score
+      ),
+  bind_cols(
+    model="Tuned Logistic Regression",
+    dataset="Train",
+    ROC = lm_tuned_train_roc$.estimate,
+    PR = lm_tuned_train_pr$.estimate,
+    Accuracy = lm_tuned_train_accuracy,
+    TPR = lm_tuned_train_tpr,
+    FPR  = lm_tuned_train_fpr,
+    Precision = lm_tuned_train_precision,
+    F_meas = lm_tuned_train_f1_score
+      ),
+  bind_cols(
+    model="Tuned KNN",
+    dataset="Train",
+    ROC = knn_tuned_train_roc$.estimate,
+    PR = knn_tuned_train_pr$.estimate,
+    Accuracy = knn_tuned_train_accuracy,
+    TPR = knn_tuned_train_tpr,
+    FPR  = knn_tuned_train_fpr,
+    Precision = knn_tuned_train_precision,
+    F_meas = knn_tuned_train_f1_score
+      ),
+  bind_cols(
+    model="Tuned Random Forest",
+    dataset="Train",
+    ROC = rf_tuned_train_roc$.estimate,
+    PR = rf_tuned_train_pr$.estimate,
+    Accuracy = rf_tuned_train_accuracy,
+    TPR = rf_tuned_train_tpr,
+    FPR  = rf_tuned_train_fpr,
+    Precision = rf_tuned_train_precision,
+    F_meas = rf_tuned_train_f1_score
+      ),
+  bind_cols(
+    model="Tuned Boost",
+    dataset="Train",
+    ROC = boost_tuned_train_roc$.estimate,
+    PR = boost_tuned_train_pr$.estimate,
+    Accuracy = boost_tuned_train_accuracy,
+    TPR = boost_tuned_train_tpr,
+    FPR  = boost_tuned_train_fpr,
+    Precision = boost_tuned_train_precision,
+    F_meas = boost_tuned_train_f1_score
+      ),
+  bind_cols(
+    model="Tuned Linear SVM",
+    dataset="Train",
+    ROC = lsvm_tuned_train_roc$.estimate,
+    PR = lsvm_tuned_train_pr$.estimate,
+    Accuracy = lsvm_tuned_train_accuracy,
+    TPR = lsvm_tuned_train_tpr,
+    FPR  = lsvm_tuned_train_fpr,
+    Precision = lsvm_tuned_train_precision,
+    F_meas = lsvm_tuned_train_f1_score
+      ),
+  bind_cols(
+    model="Tuned Polynomial SVM",
+    dataset="Train",
+    ROC = psvm_tuned_train_roc$.estimate,
+    PR = psvm_tuned_train_pr$.estimate,
+    Accuracy = psvm_tuned_train_accuracy,
+    TPR = psvm_tuned_train_tpr,
+    FPR  = psvm_tuned_train_fpr,
+    Precision = psvm_tuned_train_precision,
+    F_meas = psvm_tuned_train_f1_score
+      ),
+  bind_cols(
+    model="Tuned RBF SVM",
+    dataset="Train",
+    ROC = rbfsvm_tuned_train_roc$.estimate,
+    PR = rbfsvm_tuned_train_pr$.estimate,
+    Accuracy = rbfsvm_tuned_train_accuracy,
+    TPR = rbfsvm_tuned_train_tpr,
+    FPR  = rbfsvm_tuned_train_fpr,
+    Precision = rbfsvm_tuned_train_precision,
+    F_meas = rbfsvm_tuned_train_f1_score
+      ),
+)
+
+train_metric %>%
+  knitr::kable(digits=3, caption="Metrics for the Classification Models on Training Data") %>%
+  kableExtra::kable_styling(full_width=FALSE)
+```
+
+
+
+```{r test metrics}
+test_metric <- bind_rows(
+    bind_cols(
+    model="Logistic Regression",
+    dataset="Test",
+    ROC = lm_test_roc$.estimate,
+    PR = lm_test_pr$.estimate,
+    Threshold = lm_threshold,
+    Accuracy = lm_test_accuracy,
+    TPR = lm_test_tpr,
+    FPR  = lm_test_fpr,
+    Precision = lm_test_precision,
+    F_meas = lm_test_f1_score
+      ),
+  bind_cols(
+    model="LDA",
+    dataset="Test",
+    ROC = lda_test_roc$.estimate,
+    PR = lda_test_pr$.estimate,
+    Threshold = lda_threshold,
+    Accuracy = lda_test_accuracy,
+    TPR = lda_test_tpr,
+    FPR  = lda_test_fpr,
+    Precision = lda_test_precision,
+    F_meas = lda_test_f1_score
+      ),    
+  bind_cols(
+    model="QDA",
+    dataset="Test",
+    ROC = qda_test_roc$.estimate,
+    PR = qda_test_pr$.estimate,
+    Threshold = qda_threshold,
+    Accuracy = qda_test_accuracy,
+    TPR = qda_test_tpr,
+    FPR = qda_test_fpr,
+    Precision = qda_test_precision,
+    F_meas = qda_test_f1_score
+      ),
+  bind_cols(
+    model="Tuned Logistic Regression",
+    dataset="Test",
+    ROC = lm_tuned_test_roc$.estimate,
+    PR = lm_tuned_test_pr$.estimate,
+    Accuracy = lm_tuned_test_accuracy,
+    TPR = lm_tuned_test_tpr,
+    FPR  = lm_tuned_test_fpr,
+    Precision = lm_tuned_test_precision,
+    F_meas = lm_tuned_test_f1_score
+      ),
+  bind_cols(
+    model="Tuned KNN",
+    dataset="Test",
+    ROC = knn_tuned_test_roc$.estimate,
+    PR = knn_tuned_test_pr$.estimate,   
+    Accuracy = knn_tuned_test_accuracy,
+    TPR = knn_tuned_test_tpr,
+    FPR  = knn_tuned_test_fpr,
+    Precision = knn_tuned_test_precision,
+    F_meas = knn_tuned_test_f1_score
+      ),
+  bind_cols(
+    model="Tuned Random Forest",
+    dataset="Test",
+    ROC = rf_tuned_test_roc$.estimate,
+    PR = rf_tuned_test_pr$.estimate,
+    Accuracy = rf_tuned_test_accuracy,
+    TPR = rf_tuned_test_tpr,
+    FPR  = rf_tuned_test_fpr,
+    Precision = rf_tuned_test_precision,
+    F_meas = rf_tuned_test_f1_score
+      ),
+  bind_cols(
+    model="Tuned Boost",
+    dataset="Test",
+    ROC = boost_tuned_test_roc$.estimate,
+    PR = boost_tuned_test_pr$.estimate,
+    Accuracy = boost_tuned_test_accuracy,
+    TPR = boost_tuned_test_tpr,
+    FPR  = boost_tuned_test_fpr,
+    Precision = boost_tuned_test_precision,
+    F_meas = boost_tuned_test_f1_score
+      ),
+  bind_cols(
+    model="Tuned Linear SVM",
+    dataset="Test",
+    ROC = lsvm_tuned_test_roc$.estimate,
+    PR = lsvm_tuned_test_pr$.estimate,
+    Accuracy = lsvm_tuned_test_accuracy,
+    TPR = lsvm_tuned_test_tpr,
+    FPR  = lsvm_tuned_test_fpr,
+    Precision = lsvm_tuned_test_precision,
+    F_meas = lsvm_tuned_test_f1_score
+      ),
+  bind_cols(
+    model="Tuned Polynomial SVM",
+    dataset="Test",
+    ROC = psvm_tuned_train_roc$.estimate,
+    PR = psvm_tuned_train_pr$.estimate,
+    Accuracy = psvm_tuned_test_accuracy,
+    TPR = psvm_tuned_test_tpr,
+    FPR  = psvm_tuned_test_fpr,
+    Precision = psvm_tuned_test_precision,
+    F_meas = psvm_tuned_test_f1_score
+      ),
+  bind_cols(
+    model="Tuned RBF SVM",
+    dataset="Test",
+    ROC = rbfsvm_tuned_test_roc$.estimate,
+    PR = rbfsvm_tuned_test_pr$.estimate,
+    Accuracy = rbfsvm_tuned_test_accuracy,
+    TPR = rbfsvm_tuned_test_tpr,
+    FPR  = rbfsvm_tuned_test_fpr,
+    Precision = rbfsvm_tuned_test_precision,
+    F_meas = rbfsvm_tuned_test_f1_score
+      ),
+)
+
+test_metric %>%
+  knitr::kable(digits=3, caption="Metrics for the Classification Models on Testing Data") %>%
+  kableExtra::kable_styling(full_width=FALSE)
+```
+
+
+```{r}
+all_metrics <- rbind(train_metric, test_metric)
+all_metrics %>%
+  knitr::kable(digits=3, caption="Metrics for the Classification Models") %>%
+  kableExtra::kable_styling(full_width=FALSE)
+```
+
+
+```{r metrics-graph}
+#| warning: FALSE
+#| message: FALSE
+#| fig.cap: Figure 5. Metrics of the Classification Models Using the Training and the Holdout Datasets
+#| fig.width: 10
+#| fig.height: 5
+#| out.width: 100%
+#ggplot(all_metrics, aes(x=.estimate, y=model, color=dataset)) +
+#    geom_point() +
+#    facet_wrap(~ .metric, scale="free_x") +
+#    xlab("Metric Estimate") + ylab("Model") + labs(color = "Dataset")
+```
+
+```{r confusion-matrix}
+#| fig.cap: Figure 14. Confusion Matrix for Each Model On Holdout Data
+#| out.width: 95%
+#| fig.width: 12
+#| fig.height: 6
+#| warning: FALSE
+#| message: FALSE
+#Confusion Matrix of Test Data
+lm_test_cm <- lm_test_predict %>%
+    conf_mat(truth=Class, estimate=.pred_class)
+lda_test_cm <- lda_test_predict %>%
+    conf_mat(truth=Class, estimate=.pred_class)
+qda_test_cm <- qda_test_predict %>%
+    conf_mat(truth=Class, estimate=.pred_class)
+lm_tuned_test_cm <- lm_tune_test_predict %>%
+    conf_mat(truth=Class, estimate=.pred_class)
+knn_tuned_test_cm <- knn_tune_test_predict %>%
+    conf_mat(truth=Class, estimate=.pred_class)
+rf_tuned_test_cm <- rf_tune_test_predict %>%
+    conf_mat(truth=Class, estimate=.pred_class)
+boost_tuned_test_cm <- boost_tune_test_predict %>%
+    conf_mat(truth=Class, estimate=.pred_class)
+lsvm_tuned_test_cm <- lsvm_tune_test_predict %>%
+    conf_mat(truth=Class, estimate=.pred_class)
+psvm_tuned_test_cm <- psvm_tune_test_predict %>%
+    conf_mat(truth=Class, estimate=.pred_class)
+
+#Confusion Matrix of Threshold Test Data
+lm_test_thres_cm <- lm_test_predict %>% conf_mat(truth=Class, estimate=.pred_class)
+lda_test_thres_cm <- lda_test_predict%>% conf_mat(truth=Class, estimate=.pred_class)
+qda_test_thres_cm <- qda_test_predict%>% conf_mat(truth=Class, estimate=.pred_class)
+
+
+Truth <- factor(c('Blue_Tarp', 'Blue_Tarp', 'Non_Tarp', 'Non_Tarp'))
+Prediction <- factor(c('Blue_Tarp', 'Non_Tarp', 'Blue_Tarp', 'Non_Tarp'))
+Ylm <- lm_test_cm$table
+Ylda <- lda_test_cm$table
+Yqda <- qda_test_cm$table
+Ylm_tuned <- lm_tuned_test_cm$table
+Yknn_tuned <- knn_tuned_test_cm$table
+Yrf_tuned <- rf_tuned_test_cm$table
+Yboost_tuned <- boost_tuned_test_cm$table
+Ylsvm_tuned <- lsvm_tuned_test_cm$table
+Ypsvm_tuned <- psvm_tuned_test_cm$table
+Yrbfsvm_tuned <- rbfsvm_tuned_test_cm$table
+dflm <- data.frame(Truth, Prediction, Ylm)
+dflda <- data.frame(Truth, Prediction, Ylda)
+dfqda <- data.frame(Truth, Prediction, Yqda)
+dflm_tuned <- data.frame(Truth, Prediction, Ylm_tuned)
+dfknn_tuned <- data.frame(Truth, Prediction, Yknn_tuned)
+dfrf_tuned <- data.frame(Truth, Prediction, Yrf_tuned)
+dfboost_tuned <- data.frame(Truth, Prediction, Yboost_tuned)
+dflsvm_tuned <- data.frame(Truth, Prediction, Ylsvm_tuned)
+dfpsvm_tuned <- data.frame(Truth, Prediction, Ypsvm_tuned)
+dfpsvm_tuned <- data.frame(Truth, Prediction, Ypsvm_tuned)
+dfrbfsvm_tuned <- data.frame(Truth, Prediction, Yrbfsvm_tuned)
+Ylmthres <- lm_test_thres_cm$table
+Yldathres <- lda_test_thres_cm$table
+Yqdathres <- qda_test_thres_cm$table
+dflmthres <- data.frame(Truth, Prediction, Ylmthres)
+dfldathres <- data.frame(Truth, Prediction, Yldathres)
+dfqdathres <- data.frame(Truth, Prediction, Yqdathres)
+
+cmlm <- ggplot(data =  dflm, mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(aes(fill = Freq), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+  scale_fill_gradient(low = "grey", high = "lightblue") +
+  theme_bw() + theme(legend.position = "none") + ggtitle("Logistic Regression")
+cmlda <- ggplot(data =  dflda, mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(aes(fill = Freq), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+  scale_fill_gradient(low = "grey", high = "lightblue") +
+  theme_bw() + theme(legend.position = "none") + ggtitle("LDA")
+cmqda <- ggplot(data =  dfqda, mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(aes(fill = Freq), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+  scale_fill_gradient(low = "grey", high = "lightblue") +
+  theme_bw() + theme(legend.position = "none") + ggtitle("QDA")
+cmlmthres <- ggplot(data =  dflmthres, mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(aes(fill = Freq), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+  scale_fill_gradient(low = "grey", high = "lightblue") +
+  theme_bw() + theme(legend.position = "none") + ggtitle("Logistic Regression - Adj. Threshold")
+cmldathres <- ggplot(data =  dfldathres, mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(aes(fill = Freq), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+  scale_fill_gradient(low = "grey", high = "lightblue") +
+  theme_bw() + theme(legend.position = "none") + ggtitle("LDA - Adj. Threshold")
+cmqdathres <- ggplot(data =  dfqdathres, mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(aes(fill = Freq), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+  scale_fill_gradient(low = "grey", high = "lightblue") +
+  theme_bw() + theme(legend.position = "none") + ggtitle("QDA - Adj. Threshold")
+cmlm_tuned <- ggplot(data =  dflm_tuned, mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(aes(fill = Freq), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+  scale_fill_gradient(low = "grey", high = "lightblue") +
+  theme_bw() + theme(legend.position = "none") + ggtitle("Tuned Logistic Regression")
+cmknn_tuned <- ggplot(data =  dfknn_tuned, mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(aes(fill = Freq), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+  scale_fill_gradient(low = "grey", high = "lightblue") +
+  theme_bw() + theme(legend.position = "none") + ggtitle("Tuned KNN")
+cmrf_tuned <- ggplot(data =  dfrf_tuned, mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(aes(fill = Freq), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+  scale_fill_gradient(low = "grey", high = "lightblue") +
+  theme_bw() + theme(legend.position = "none") + ggtitle("Tuned Random Forest")
+cmboost_tuned <- ggplot(data =  dfboost_tuned, mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(aes(fill = Freq), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+  scale_fill_gradient(low = "grey", high = "lightblue") +
+  theme_bw() + theme(legend.position = "none") + ggtitle("Tuned Boost")
+cmlsvm_tuned <- ggplot(data =  dflsvm_tuned, mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(aes(fill = Freq), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+  scale_fill_gradient(low = "grey", high = "lightblue") +
+  theme_bw() + theme(legend.position = "none") + ggtitle("Tuned Linear SVM")
+cmpsvm_tuned <- ggplot(data =  dfpsvm_tuned, mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(aes(fill = Freq), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+  scale_fill_gradient(low = "grey", high = "lightblue") +
+  theme_bw() + theme(legend.position = "none") + ggtitle("Tuned Polynomial SVM")
+cmrbfsvm_tuned <- ggplot(data =  dfrbfsvm_tuned, mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(aes(fill = Freq), colour = "white") +
+  geom_text(aes(label = sprintf("%1.0f", Freq)), vjust = 1) +
+  scale_fill_gradient(low = "grey", high = "lightblue") +
+  theme_bw() + theme(legend.position = "none") + ggtitle("Tuned RBF SVM")
+
+#{cmlm + cmlda + cmqda+ plot_layout(ncol = 3,widths = c(3,3,3))} / 
+  {cmlmthres + cmqdathres + cmlm_tuned + plot_layout(ncol = 3,widths = c(3,3,3))} /
+  {cmknn_tuned + cmrf_tuned + cmboost_tuned + plot_layout(ncol = 3,widths = c(3,3,3))} /
+  {cmlsvm_tuned + cmpsvm_tuned + cmrbfsvm_tuned + plot_layout(ncol = 3,widths = c(3,3,3))}
+```
+
+```{r metrics-graph,fig.width=12, fig.height=6}
+all_metrics <-  rbind(train_metric, test_metric)
+
+all_metrics <- all_metrics%>%
+  select('model','dataset','ROC','PR','F_meas') %>%
+  arrange(model) %>% 
+  pivot_longer(cols = c('ROC','PR','F_meas') 
+               ,names_to = "metric", values_to = "value")
+  
+  ggplot(all_metrics, aes(x=value, y=model, color=dataset)) +
+    geom_point() +
+    facet_wrap(~ metric, scale="free_x") +
+    xlab("Metric Estimate") + ylab("Model") + labs(color = "Dataset")
+
+all_metrics %>%
+  mutate(model = factor(model, levels = c("Tuned RBF SVM",
+  "Tuned Polynomial SVM",
+  "Tuned Linear SVM",
+  "Tuned Boost",
+  "Tuned Random Forest",
+  "Tuned KNN",
+  "Tuned Logistic Regression",
+   "QDA",
+  "LDA",
+  "Logistic Regression"))) %>%
+  ggplot(aes(x=value, y=model, color=dataset)) +
+    geom_point() +
+    facet_wrap(~ metric, scale="free_x") +
+    xlab("Metric Estimate") + 
+  ylab("Model") + 
+  labs(color = "Dataset")
+```
+
+```{r stop-cluster}
+#| warning: FALSE
+#| message: FALSE
+stopCluster(cl)
+registerDoSEQ()
+```
